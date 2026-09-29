@@ -1,0 +1,10 @@
+.build/
+.test-runs/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+.DS_Store
+dist/

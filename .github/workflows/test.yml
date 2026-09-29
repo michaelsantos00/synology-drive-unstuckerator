@@ -1,0 +1,17 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the package tests
+        # macos-15 defaults to Xcode 16.4 (Swift 6.1). Liquid Glass is compiled
+        # against the macOS 26 SDK, which this image provides in Xcode 26.3.
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: swift test

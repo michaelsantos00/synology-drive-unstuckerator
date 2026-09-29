@@ -1,0 +1,52 @@
+Evaluating actions against {
+    fileproviderItems =     (
+                {
+            capabilities = 536870959;
+            contentModificationDate = "2026-09-23 14:55:33 +0000";
+            contentType = "public.mpeg-4";
+            creationDate = "2026-09-23 14:55:26 +0000";
+            displayName = "EDUC - E56 - 07 Episode.mp4";
+            documentSize = 2613855666;
+            filename = "EDUC - E56 - 07 Episode.mp4";
+            hasUnresolvedConflicts = 0;
+            inheritedUserInfo =             {
+            };
+            isDownloadRequested = 0;
+            isDownloaded = 1;
+            isDownloading = 0;
+            isExcludedFromSync = 0;
+            isFolder = 0;
+            isKeepDownloaded = 0;
+            isMostRecentVersionDownloaded = 1;
+            isRecursivelyDownloaded = 1;
+            isShared = 0;
+            isSharedByCurrentUser = 0;
+            isSyncPaused = 0;
+            isTrashed = 0;
+            isUploaded = 0;
+            isUploading = 1;
+            itemIdentifier = 974755024032807400;
+            parentItemIdentifier = 973694127401123834;
+            resolvedUserInfo =             {
+            };
+            typeIdentifier = "public.mpeg-4";
+            uploadingError = "Error Domain=NSFileProviderErrorDomain Code=-2005 \"Error Domain=NSFileProviderErrorDomain Code=-2005 \"(null)\"\" UserInfo={NSDebugDescription=Error Domain=NSFileProviderErrorDomain Code=-2005 \"(null)\", NSLocalizedDescription=The operation couldn\U2019t be completed. (NSFileProviderErrorDomain error -2005.)}";
+            userInfo =             {
+                nodeLockingEnabled = 0;
+                showEvict = 1;
+                showLock = 0;
+                showPin = 1;
+                showUnlock = 0;
+                showUnpin = 0;
+            };
+            versionIdentifier = {length = 32, bytes = 0x33316436 63666530 64313661 65393331 ... 65306330 38396330 };
+        }
+    );
+}
+
+Actions:
+com.synology.CloudStationUI.FileProvider.Action.Lock: fileproviderItems.@count == 1 AND Code=-2005 - NO
+
+Decorations:
+
+Sync is paused: no
