@@ -1,0 +1,3 @@
+import DriveMonitorUI
+
+SynologyDriveMonitorApp.main()
