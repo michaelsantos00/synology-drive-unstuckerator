@@ -40,9 +40,13 @@ public actor MonitoringEngine {
     public private(set) var isPaused = false
     public private(set) var lastScanAt: Date?
     public private(set) var lastError: String?
+    public private(set) var unavailableRootIDs: Set<UUID> = []
 
+    private let repairAccess: RepairAccess
+    private let pendingRepair: @Sendable (String) throws -> Bool
     private let store: any FindingStoring
     private let saveRoot: @Sendable (WatchedRootSnapshot) async throws -> Void
+    private let saveBaseline: (@Sendable (UUID, Date) async throws -> Void)?
     private let runner: any CommandRunning
     private let interpreting: EvaluationInterpreting
     private let watcherFactory: @Sendable () -> any DirectoryWatching
@@ -51,18 +55,24 @@ public actor MonitoringEngine {
     private let schedulesReconciliation: Bool
     private let now: @Sendable () -> Date
     private var roots: [WatchedRootSnapshot] = []
-    private var watchers: [any DirectoryWatching] = []
+    private var watchingRootIDs: Set<UUID> = []
+    private var watchers: [UUID: any DirectoryWatching] = [:]
     private var pending: [String: (id: UUID, task: Task<Void, Never>)] = [:]
     private var reconciliationTask: Task<Void, Never>?
+    private var scanning = false
     private var evaluating: Set<String> = []
-    private var followUps: [UUID: Task<Void, Never>] = [:]
+    private var followUps: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+    private var onPathChange: @Sendable (String) async -> Void = { _ in }
     private var onStoreChange: @Sendable () async -> Void = {}
     private var started = false
     private var generation = UUID()
 
     public init(
         store: any FindingStoring,
+        repairAccess: RepairAccess = RepairAccess(),
+        pendingRepair: @escaping @Sendable (String) throws -> Bool = { _ in false },
         saveRoot: @escaping @Sendable (WatchedRootSnapshot) async throws -> Void,
+        saveBaseline: (@Sendable (UUID, Date) async throws -> Void)? = nil,
         runner: any CommandRunning,
         interpreting: EvaluationInterpreting,
         watcherFactory: @escaping @Sendable () -> any DirectoryWatching = { FSEventsDirectoryWatcher() },
@@ -71,8 +81,11 @@ public actor MonitoringEngine {
         schedulesReconciliation: Bool = true,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
+        self.repairAccess = repairAccess
+        self.pendingRepair = pendingRepair
         self.store = store
         self.saveRoot = saveRoot
+        self.saveBaseline = saveBaseline
         self.runner = runner
         self.interpreting = interpreting
         self.watcherFactory = watcherFactory
@@ -83,22 +96,37 @@ public actor MonitoringEngine {
     }
 
     public func cancelPendingFollowUps() {
-        for work in followUps.values { work.cancel() }
+        for work in followUps.values { work.task.cancel() }
         followUps.removeAll()
     }
+
+    public func setPathChangeHandler(_ handler: @escaping @Sendable (String) async -> Void) { onPathChange = handler }
 
     public func setStoreChangeHandler(_ handler: @escaping @Sendable () async -> Void) {
         onStoreChange = handler
     }
 
-    public func start(roots: [WatchedRootSnapshot]) async throws {
+    public static func validateConfiguration(_ roots: [WatchedRootSnapshot], allowUnavailable: Bool = false) throws {
+        guard Set(roots.map(\.id)).count == roots.count else {
+            throw MonitoringError.blocked(reason: "Watched root identifiers must be unique.")
+        }
+        for root in roots where root.enabled {
+            do { try validateRoot(root) }
+            catch let error as CocoaError where allowUnavailable {
+                // Saved roots may be temporarily offline; explicit new settings remain strict.
+                guard root.path.hasPrefix("/"), root.minimumStableAge.isFinite, root.minimumStableAge >= 0 else { throw error }
+            }
+        }
+    }
+
+    public func start(roots: [WatchedRootSnapshot], paused: Bool = false, persist: Bool = true, allowUnavailable: Bool = false) async throws {
+        try Self.validateConfiguration(roots, allowUnavailable: allowUnavailable)
         stop()
         let startGeneration = generation
         guard Set(roots.map(\.id)).count == roots.count else {
             throw MonitoringError.blocked(reason: "Watched root identifiers must be unique.")
         }
-        for root in roots where root.enabled { try Self.validateRoot(root) }
-        for root in roots {
+        for root in roots where persist {
             try await saveRoot(root)
             guard generation == startGeneration else {
                 throw MonitoringError.blocked(reason: "Monitoring configuration changed while roots were being saved.")
@@ -106,7 +134,8 @@ public actor MonitoringEngine {
         }
         self.roots = roots
         started = true
-        isPaused = false
+        isPaused = paused
+        guard !paused else { return }
         do { try installWatchers(); scheduleReconciliation() }
         catch { stop(); throw error }
     }
@@ -124,9 +153,9 @@ public actor MonitoringEngine {
     public func resume() throws {
         guard started else { throw MonitoringError.blocked(reason: "Choose and confirm a watched folder first.") }
         guard isPaused else { return }
-        for root in roots where root.enabled { try Self.validateRoot(root) }
+        try Self.validateConfiguration(roots, allowUnavailable: true)
         isPaused = false
-        do { try installWatchers(); scheduleReconciliation() }
+        do { try installWatchers(); scheduleReconciliation(); Task { await scheduledReconcile() } }
         catch { pause(); throw error }
     }
 
@@ -136,8 +165,10 @@ public actor MonitoringEngine {
         }
         guard root.baselineCompletedAt == nil else { return }
         root.baselineCompletedAt = now()
-        // Persist before allowing any later evaluation to see an acknowledged baseline.
-        try await saveRoot(root)
+        // Persist before allowing any later evaluation to see an acknowledged baseline. Saving only the
+        // date keeps a rules change made during this await from being overwritten by this older copy.
+        if let saveBaseline, let date = root.baselineCompletedAt { try await saveBaseline(rootID, date) }
+        else { try await saveRoot(root) }
         guard let index = roots.firstIndex(where: { $0.id == rootID && $0.path == root.path }) else {
             throw MonitoringError.blocked(reason: "The watched root changed during baseline acknowledgement.")
         }
@@ -176,23 +207,35 @@ public actor MonitoringEngine {
 
     public func reconcile() async throws {
         guard started, !isPaused else { return }
-        _ = try await scanRecentFiles(manual: false)
+        try installWatchers()
+        let checked = try await scanRecentFiles(manual: false)
+        try await recheckKnownFailures(excluding: checked, manual: false)
     }
 
     public func scanNow() async throws {
         guard started else { throw MonitoringError.blocked(reason: "Choose and confirm a watched folder first.") }
+        if !isPaused { try installWatchers() }
         let scanned = try await scanRecentFiles(manual: true)
+        try await recheckKnownFailures(excluding: scanned, manual: true)
+    }
+
+    private func recheckKnownFailures(excluding scanned: Set<String>, manual: Bool) async throws {
+        let scanGeneration = generation
         let unresolved = try await store.findings(matching: nil).filter { Self.isUnresolved($0.disposition) }
         var checked = scanned
-        for finding in unresolved where !checked.contains(finding.canonicalPath) {
+        for finding in unresolved where !checked.contains(finding.canonicalPath) && !unavailableRootIDs.contains(finding.rootIdentifier) {
+            guard started, !Task.isCancelled, manual || (!isPaused && generation == scanGeneration) else { break }
             checked.insert(finding.canonicalPath)
-            _ = try await evaluateFile(finding.canonicalPath)
+            _ = try await evaluate(path: finding.canonicalPath, manual: manual)
         }
     }
 
     /// Metadata walk of each watched tree. Only eligible files modified in the last seven days are evaluated.
     /// File contents are not opened, and older files are not sent to fileproviderctl.
     private func scanRecentFiles(manual: Bool) async throws -> Set<String> {
+        guard !scanning else { throw MonitoringError.blocked(reason: "A scan is already running.") }
+        scanning = true
+        defer { scanning = false }
         let scanGeneration = generation
         let scanDate = now()
         let cutoff = scanDate.addingTimeInterval(-7 * 24 * 60 * 60)
@@ -200,20 +243,65 @@ public actor MonitoringEngine {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey, .contentModificationDateKey]
         for root in roots where root.enabled {
             guard started, manual || (!isPaused && generation == scanGeneration) else { break }
-            let candidates = Self.recentCandidates(root: root, cutoff: cutoff, scanDate: scanDate, keys: keys)
-            for url in candidates {
-                guard started, manual || (!isPaused && generation == scanGeneration) else { break }
-                let path = url.standardizedFileURL.path
-                guard evaluated.insert(path).inserted else { continue }
-                _ = try await evaluate(path: path, manual: manual)
+            let discovery = CandidateDiscovery(root: root, cutoff: cutoff, scanDate: scanDate, keys: keys)
+            do {
+                while let candidates = try await discovery.nextBatch() {
+                    guard started, !Task.isCancelled, manual || (!isPaused && generation == scanGeneration) else { break }
+                    for url in candidates {
+                        guard started, !Task.isCancelled, manual || (!isPaused && generation == scanGeneration) else { break }
+                        let path = url.standardizedFileURL.path
+                        guard evaluated.insert(path).inserted else { continue }
+                        _ = try await evaluate(path: path, manual: manual)
+                    }
+                }
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                unavailableRootIDs.insert(root.id)
+                watchingRootIDs.remove(root.id)
+                watchers.removeValue(forKey: root.id)?.stop()
+                lastError = error.localizedDescription
+                try await record(.compatibility, summary: "Watched folder scan unavailable.", details: lastError)
             }
         }
+
+        guard started, generation == scanGeneration, !Task.isCancelled else { throw CancellationError() }
         lastScanAt = scanDate
         try await record(.scan, summary: "Recent-file scan completed.", details: "Seven-day window; \(evaluated.count) candidate paths inspected.")
+        await onStoreChange()
         return evaluated
     }
 
     private func evaluate(path: String, manual: Bool) async throws -> MonitoringDecision {
+        // Path rules need no lease. Checking them first keeps temporary and ineligible files from
+        // leaving a lock file behind, and from triggering store refreshes, on every file event.
+        if let rejection = pathRuleRejection(path) { return rejection }
+        do {
+            let decision = try await repairAccess.withAccess(to: path) {
+                try await self.evaluateLocked(path: path, manual: manual)
+            }
+            // Consumers may start a repair in response; release the scan's path lease first.
+            await onPathChange(path)
+            await onStoreChange()
+            return decision
+        } catch RepairAccessError.busy {
+            return .blocked(reason: "A check or repair already owns this path; the rest of the scan can continue.")
+        }
+    }
+
+    /// The same path-only rules `evaluateLocked` applies, without touching the lease or the store.
+    private func pathRuleRejection(_ path: String) -> MonitoringDecision? {
+        guard path.hasPrefix("/") else { return .blocked(reason: "An absolute file path is required.") }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let canonical = url.resolvingSymlinksInPath().path
+        guard let root = matchingRoot(path: canonical) else { return .blocked(reason: "The path is outside enabled watched roots.") }
+        if case .reject(let reason) = interpreting.candidate(canonical, root.minimumStableAge) { return .rejected(reason: reason) }
+        guard Self.extensionIsEligible(url, root: root), !Self.isIgnored(url, root: root) else {
+            return .rejected(reason: "The extension or ignore rules exclude this path.")
+        }
+        return nil
+    }
+
+    private func evaluateLocked(path: String, manual: Bool) async throws -> MonitoringDecision {
         guard path.hasPrefix("/") else { return .blocked(reason: "An absolute file path is required.") }
         guard started, manual || !isPaused else { return .blocked(reason: "Monitoring is stopped or paused.") }
         let url = URL(fileURLWithPath: path).standardizedFileURL
@@ -229,12 +317,19 @@ public actor MonitoringEngine {
         guard evaluating.insert(canonical).inserted else { return .blocked(reason: "An evaluation of this path is already in progress.") }
         defer { evaluating.remove(canonical) }
         let workGeneration = generation
-        let all = try await store.findings(matching: nil)
+        let all = try await store.findings(at: canonical)
         let previous = all.filter { $0.canonicalPath == canonical && $0.rootIdentifier == root.id }
             .sorted { $0.lastCheckedAt > $1.lastCheckedAt }
+        guard !Task.isCancelled else { return .blocked(reason: "Evaluation canceled.") }
+        guard try !pendingRepair(canonical), !previous.contains(where: {
+            $0.hasRepairEvidence && ![.requeueSucceeded, .resolved, .ignored].contains($0.disposition)
+        }) else { return .blocked(reason: "A repair owns this path. Use Check upload or Recovery.") }
         let metadata: FileMetadata
         do { metadata = try Self.metadata(url) }
         catch {
+            if !FileManager.default.fileExists(atPath: canonical) {
+                return try await retireMissing(path: canonical, root: root, previous: previous)
+            }
             return try await block(path: canonical, root: root, metadata: nil, previous: previous.first,
                                    reason: "Source metadata cannot be verified: \(error.localizedDescription)", raw: nil)
         }
@@ -242,6 +337,25 @@ public actor MonitoringEngine {
             return .blocked(reason: "The source path changed while its metadata was inspected.")
         }
         var existing = previous.first { metadata.matches($0) }
+        // An export's unconfirmed observation follows the file as it grows. Repair evidence
+        // and confirmed versions keep their identity and history instead of being rewritten.
+        if existing == nil, let growing = previous.first(where: {
+            $0.inode == metadata.inode && $0.disposition == .observing && !$0.hasRepairEvidence
+                && $0.attemptCount == 0 && $0.confirmationCount == 0 && $0.errorCode == nil
+        }) {
+            var refreshed = metadata.finding(root: root, at: now())
+            refreshed.id = growing.id
+            refreshed.firstDetectedAt = growing.firstDetectedAt
+            existing = refreshed
+        }
+        // Also reconcile duplicates saved by earlier builds, including while the file is
+        // still young. Preserve those snapshots as history; never touch their media files.
+        for var older in previous where older.id != existing?.id
+            && Self.isUnresolved(older.disposition) && !older.hasRepairEvidence {
+            older.disposition = .sourceChanged
+            older.eligibilityBlockReason = "A newer observation tracks this path; this snapshot is retained as history."
+            try await store.upsert(older)
+        }
         if !manual, let existing, [.ignored, .resolved, .requeueSucceeded].contains(existing.disposition) {
             return .rejected(reason: "This source version has already been ignored or resolved.")
         }
@@ -254,20 +368,15 @@ public actor MonitoringEngine {
             finding.eligibilityBlockReason = reason
             finding.disposition = .observing
             finding.confirmationCount = 0
+            finding.lastConfirmedAt = nil
             finding.errorDomain = nil
             finding.errorCode = nil
             try await store.upsert(finding)
-            await onStoreChange()
             scheduleFollowUp(path: canonical, after: .seconds(max(1, root.minimumStableAge - age + 1)))
             return .rejected(reason: reason)
         }
         guard started, manual || (!isPaused && generation == workGeneration), !Task.isCancelled else {
             return .blocked(reason: "Monitoring changed before evaluation could start.")
-        }
-        for var older in previous where !metadata.matches(older) && Self.isUnresolved(older.disposition) {
-            older.disposition = .sourceChanged
-            older.eligibilityBlockReason = "The source version changed; this finding no longer describes the current file."
-            try await store.upsert(older)
         }
         guard started, generation == workGeneration, !Task.isCancelled else {
             return .blocked(reason: "Monitoring changed before evaluation could start.")
@@ -390,12 +499,16 @@ public actor MonitoringEngine {
                 scheduleFollowUp(path: canonical, after: .seconds(61))
             }
 
-        case .uploading, .notUploaded, .excluded, .syncPaused, .missingItem:
+        case .uploading, .notUploaded, .excluded, .syncPaused, .missingItem, .uploadError:
             guard existing != nil else { return .evaluated }
             finding.providerState = Self.description(classification)
             finding.confirmationCount = 0
             finding.lastConfirmedAt = nil
-            finding.eligibilityBlockReason = "A current actionable permanent upload failure has not been confirmed."
+            if case .uploadError = classification {
+                finding.eligibilityBlockReason = "Synology reports a different upload error, often temporary (offline, storage full, or sign-in). It is not the stuck-upload failure Fix repairs; the file is checked again later."
+            } else {
+                finding.eligibilityBlockReason = "A current actionable permanent upload failure has not been confirmed."
+            }
             if !locallyClosed && finding.disposition != .existingNeedsReview { finding.disposition = .observing }
 
         case .incompatible:
@@ -407,8 +520,31 @@ public actor MonitoringEngine {
                              summary: "\(finding.filename): \(finding.providerState)", details: finding.eligibilityBlockReason,
                              result: finding.disposition.rawValue)
         }
-        await onStoreChange()
         return .evaluated
+    }
+
+    /// Provider state of an observation retired because its file left the path.
+    public static let movedOrDeletedState = "Moved or deleted"
+
+    /// A moved or deleted file is not a provider problem. Blocking it would leave a permanent
+    /// "cannot read" alert that is re-logged on every reconcile, so its observation becomes history.
+    private func retireMissing(path: String, root: WatchedRootSnapshot, previous: [FindingSnapshot]) async throws -> MonitoringDecision {
+        // An offline watched folder makes every file look missing; leave its rows alone.
+        guard FileManager.default.fileExists(atPath: root.path) else {
+            return .blocked(reason: "The watched folder is unavailable.")
+        }
+        // Repair evidence and ignore decisions keep their rows; other states describe a file that is gone.
+        for var finding in previous where !finding.hasRepairEvidence
+            && [.observing, .compatibilityBlocked, .actionable, .existingNeedsReview].contains(finding.disposition) {
+            finding.disposition = .sourceChanged
+            finding.lastCheckedAt = now()
+            finding.providerState = Self.movedOrDeletedState
+            finding.eligibilityBlockReason = "The file is no longer at this path. This observation is kept as history."
+            try await store.upsert(finding)
+            try await record(.lifecycle, findingID: finding.id, summary: "\(finding.filename): moved or deleted; kept as history.",
+                             result: finding.disposition.rawValue)
+        }
+        return .rejected(reason: "The file is no longer at this path.")
     }
 
     private func block(path: String, root: WatchedRootSnapshot, metadata: FileMetadata?, previous: FindingSnapshot?, reason: String, raw: String?) async throws -> MonitoringDecision {
@@ -428,25 +564,35 @@ public actor MonitoringEngine {
         finding.rawDiagnostic = raw
         try await store.upsert(finding)
         try await record(.compatibility, findingID: finding.id, summary: "Verification blocked for \(finding.filename).", details: finding.eligibilityBlockReason)
-        await onStoreChange()
         return .blocked(reason: finding.eligibilityBlockReason!)
     }
 
     private func scheduleFollowUp(path: String, after delay: Duration) {
+        followUps[path]?.task.cancel()
         let id = UUID()
         let generation = generation
         let task = Task { [weak self] in
-            try? await Task.sleep(for: delay)
+            do { try await Task.sleep(for: delay) } catch { return }
             await self?.runFollowUp(path: path, id: id, generation: generation)
         }
-        followUps[id] = task
+        followUps[path] = (id, task)
     }
 
     private func runFollowUp(path: String, id: UUID, generation: UUID) async {
-        followUps[id] = nil
-        guard started, !isPaused, self.generation == generation else { return }
+        guard followUps[path]?.id == id else { return }
+        followUps[path] = nil
+        guard started, !isPaused, !Task.isCancelled, self.generation == generation else { return }
         do { _ = try await handle(path: path) }
-        catch { lastError = error.localizedDescription }
+        catch { await reportBackgroundFailure(error, path: path) }
+    }
+
+    /// Event-driven checks have no caller to show an error to; Activity is where it can be seen.
+    private func reportBackgroundFailure(_ error: Error, path: String) async {
+        guard !(error is CancellationError) else { return }
+        lastError = error.localizedDescription
+        try? await record(.compatibility, summary: "A background check of \(URL(fileURLWithPath: path).lastPathComponent) did not finish.",
+                          details: error.localizedDescription)
+        await onStoreChange()
     }
 
     private func matchingRoot(path: String) -> WatchedRootSnapshot? {
@@ -463,12 +609,18 @@ public actor MonitoringEngine {
         guard started, !isPaused, self.generation == generation, pending[path]?.id == id else { return }
         pending[path] = nil
         do { _ = try await handle(path: path) }
-        catch { lastError = error.localizedDescription }
+        catch { await reportBackgroundFailure(error, path: path) }
     }
 
     private func installWatchers() throws {
         let generation = generation
-        for root in roots where root.enabled {
+        for root in roots where root.enabled && !watchingRootIDs.contains(root.id) {
+            do { try Self.validateRoot(root) }
+            catch let error as CocoaError {
+                unavailableRootIDs.insert(root.id)
+                lastError = "Watched folder unavailable: \(root.displayName). \(error.localizedDescription)"
+                continue
+            }
             let watcher = watcherFactory()
             do {
                 try watcher.start(root: URL(fileURLWithPath: root.path)) { [weak self] path in
@@ -476,15 +628,35 @@ public actor MonitoringEngine {
                 }
             } catch {
                 watcher.stop()
-                throw error
+                unavailableRootIDs.insert(root.id)
+                lastError = "Watched folder events unavailable: \(root.displayName). \(error.localizedDescription)"
+                continue
             }
-            watchers.append(watcher)
+            unavailableRootIDs.remove(root.id)
+            watchingRootIDs.insert(root.id)
+            watchers[root.id] = watcher
         }
     }
 
     private func acceptEvent(path: String, generation: UUID) {
         guard self.generation == generation else { return }
-        note(path: path)
+        if roots.contains(where: { $0.path == path }) { requestReconciliation() }
+        else { note(path: path) }
+    }
+
+    private var eventReconcileTask: Task<Void, Never>?
+    public func requestReconciliation() {
+        guard started, !isPaused, eventReconcileTask == nil else { return }
+        let expected = generation
+        eventReconcileTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            await self?.reconcileEvent(expected)
+        }
+    }
+    private func reconcileEvent(_ expected: UUID) async {
+        defer { eventReconcileTask = nil }
+        guard generation == expected, !Task.isCancelled else { return }
+        await scheduledReconcile()
     }
 
     private func scheduleReconciliation() {
@@ -501,6 +673,7 @@ public actor MonitoringEngine {
 
     private func scheduledReconcile() async {
         do { try await reconcile() }
+        catch is CancellationError { return }
         catch {
             lastError = error.localizedDescription
             do { try await record(.compatibility, summary: "Scheduled reconciliation was blocked.", details: lastError) }
@@ -512,45 +685,63 @@ public actor MonitoringEngine {
         generation = UUID()
         for work in pending.values { work.task.cancel() }
         pending.removeAll()
-        for work in followUps.values { work.cancel() }
+        for work in followUps.values { work.task.cancel() }
         followUps.removeAll()
         reconciliationTask?.cancel()
         reconciliationTask = nil
-        for watcher in watchers { watcher.stop() }
+        eventReconcileTask?.cancel()
+        eventReconcileTask = nil
+        for watcher in watchers.values { watcher.stop() }
         watchers.removeAll()
+        watchingRootIDs.removeAll()
+        unavailableRootIDs.removeAll()
     }
 
     deinit {
         reconciliationTask?.cancel()
         for work in pending.values { work.task.cancel() }
-        for work in followUps.values { work.cancel() }
-        for watcher in watchers { watcher.stop() }
+        for work in followUps.values { work.task.cancel() }
+        for watcher in watchers.values { watcher.stop() }
     }
 
-    private static func recentCandidates(root: WatchedRootSnapshot, cutoff: Date, scanDate: Date, keys: Set<URLResourceKey>) -> [URL] {
-        let rootURL = URL(fileURLWithPath: root.path)
-        guard let enumerator = FileManager.default.enumerator(
-            at: rootURL,
-            includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return [] }
-        var matches: [URL] = []
-        for case let url as URL in enumerator {
-            if url.pathComponents.contains(".git") {
-                if url.lastPathComponent == ".git" { enumerator.skipDescendants() }
-                continue
-            }
-            if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-                enumerator.skipDescendants()
-                continue
-            }
-            guard extensionIsEligible(url, root: root) else { continue }
-            guard let values = try? url.resourceValues(forKeys: keys) else { continue }
-            guard values.isDirectory != true, values.isRegularFile == true, values.isSymbolicLink == false else { continue }
-            guard let date = values.contentModificationDate, date >= cutoff, date <= scanDate else { continue }
-            matches.append(url)
+    private actor CandidateDiscovery {
+        private let root: WatchedRootSnapshot
+        private let cutoff: Date
+        private let scanDate: Date
+        private let keys: Set<URLResourceKey>
+        private var enumerator: FileManager.DirectoryEnumerator?
+        private var initialized = false
+        init(root: WatchedRootSnapshot, cutoff: Date, scanDate: Date, keys: Set<URLResourceKey>) {
+            self.root = root; self.cutoff = cutoff; self.scanDate = scanDate; self.keys = keys
         }
-        return matches
+        func nextBatch() throws -> [URL]? {
+            try Task.checkCancellation()
+            if !initialized {
+                let url = URL(fileURLWithPath: root.path)
+                guard try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                    throw MonitoringError.blocked(reason: "Watched folder is unavailable: \(root.displayName)")
+                }
+                enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles, .skipsPackageDescendants])
+                guard enumerator != nil else { throw MonitoringError.blocked(reason: "Watched folder cannot be scanned: \(root.displayName)") }
+                initialized = true
+            }
+            guard let enumerator else { return nil }
+            var matches: [URL] = []
+            var inspected = 0
+            while inspected < 128, let url = enumerator.nextObject() as? URL {
+                inspected += 1
+                try Task.checkCancellation()
+                if url.pathComponents.contains(".git") { enumerator.skipDescendants(); continue }
+                guard let values = try? url.resourceValues(forKeys: keys) else { continue }
+                if values.isSymbolicLink == true { enumerator.skipDescendants(); continue }
+                guard MonitoringEngine.extensionIsEligible(url, root: root), !MonitoringEngine.isIgnored(url, root: root),
+                      values.isDirectory != true, values.isRegularFile == true, values.isSymbolicLink == false,
+                      let date = values.contentModificationDate, date >= cutoff, date <= scanDate else { continue }
+                matches.append(url)
+            }
+            if inspected == 0 { self.enumerator = nil; return nil }
+            return matches
+        }
     }
 
     private static func validateRoot(_ root: WatchedRootSnapshot) throws {
@@ -591,6 +782,7 @@ public actor MonitoringEngine {
         case .syncPaused: "Sync paused"
         case .missingItem: "Provider item unavailable"
         case .permanentFailure: "Permanent upload failure"
+        case .uploadError(let domain, let code): "Upload error (\(domain) \(code))"
         case .incompatible: "Verification blocked"
         }
     }
@@ -642,71 +834,6 @@ public struct ProcessCommandRunner: CommandRunning {
               arguments[0] == "evaluate", arguments[1].hasPrefix("/") else {
             throw MonitoringError.blocked(reason: "Only an explicit read-only provider evaluation is supported.")
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            let once = ResumeOnce()
-            DispatchQueue.global(qos: .utility).async {
-                do {
-                    once.finish(continuation, result: .success(try Self.runSynchronously(executable: executable, arguments: arguments)))
-                } catch {
-                    once.finish(continuation, result: .failure(error))
-                }
-            }
-            // The child is left running. This app does not signal fileproviderd or the evaluate process.
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 60) {
-                once.finish(continuation, result: .failure(MonitoringError.blocked(reason: "Provider evaluation timed out.")))
-            }
-        }
+        return try await BoundedProcess.run(executable: executable, arguments: arguments, timeout: 60)
     }
-
-    private static func runSynchronously(executable: URL, arguments: [String]) throws -> CommandResult {
-            let process = Process()
-            let output = Pipe()
-            let errors = Pipe()
-            process.executableURL = executable
-            process.arguments = arguments
-            process.standardOutput = output
-            process.standardError = errors
-            try process.run()
-            let group = DispatchGroup()
-            let capturedOutput = CapturedData()
-            let capturedErrors = CapturedData()
-            // Drain both pipes concurrently so large diagnostics cannot fill a pipe and deadlock.
-            group.enter()
-            DispatchQueue.global(qos: .utility).async {
-                capturedOutput.set(output.fileHandleForReading.readDataToEndOfFile())
-                group.leave()
-            }
-            group.enter()
-            DispatchQueue.global(qos: .utility).async {
-                capturedErrors.set(errors.fileHandleForReading.readDataToEndOfFile())
-                group.leave()
-            }
-            process.waitUntilExit()
-            group.wait()
-            guard let stdout = String(data: capturedOutput.get(), encoding: .utf8) else {
-                throw MonitoringError.blocked(reason: "Provider command output is not valid UTF-8.")
-            }
-            let stderr = String(decoding: capturedErrors.get(), as: UTF8.self)
-            return CommandResult(exitCode: process.terminationStatus, standardOutput: stdout, standardError: stderr)
-    }
-}
-
-private final class ResumeOnce: @unchecked Sendable {
-    private let lock = NSLock()
-    private var finished = false
-
-    func finish(_ continuation: CheckedContinuation<CommandResult, Error>, result: Result<CommandResult, Error>) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !finished else { return }
-        finished = true
-        continuation.resume(with: result)
-    }
-}
-
-private final class CapturedData: @unchecked Sendable {
-    private let lock = NSLock()
-    private var data = Data()
-    func set(_ value: Data) { lock.withLock { data = value } }
-    func get() -> Data { lock.withLock { data } }
 }

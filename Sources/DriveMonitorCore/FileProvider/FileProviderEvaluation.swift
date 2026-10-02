@@ -53,6 +53,8 @@ public enum EvaluationClassification: Equatable, Sendable {
     case uploaded
     case uploading
     case permanentFailure(domain: String, code: Int)
+    /// A readable upload error other than the stuck-upload failure (offline, quota, sign-in). Never actionable.
+    case uploadError(domain: String, code: Int)
     case excluded
     case syncPaused
     case notUploaded

@@ -7,7 +7,7 @@ import Testing
         let fixture = try Scratch()
         let source = fixture.file("original.mp4", contents: Data("episode-bytes".utf8))
         let before = try Data(contentsOf: source)
-        let plan = samplePlan()
+        let plan = try samplePlan(source)
         let report = await RequeueExecutor.publish(
             decision: .publish(plan),
             plan: plan,
@@ -17,13 +17,41 @@ import Testing
             openForWriting: false,
             effects: .system(),
             evaluate: { _ in uploadedEvaluation(identifier: "retry-1") },
-            maxPolls: 1
+            maxPolls: 1, persist: { _ in }
         )
         #expect(report.outcome == .uploaded(itemIdentifier: "retry-1"))
         #expect(try Data(contentsOf: source) == before)
         let published = fixture.root.appendingPathComponent("target").appendingPathComponent(plan.retryFileName)
         #expect(FileManager.default.fileExists(atPath: published.path))
         #expect(try Data(contentsOf: published) == before)
+    }
+
+    @Test func metadataOnlySourceChangeDuringHashingStillPublishes() async throws {
+        let fixture = try Scratch()
+        let source = fixture.file("original.mp4", contents: Data("episode-bytes".utf8))
+        let before = try FileIntegrity.identity(source)
+        let system = RequeueEffects.system()
+        var effects = system
+        effects.hashFile = { url in
+            if url.lastPathComponent == "original.mp4" {
+                // A provider metadata update: change time moves; bytes and modification time do not.
+                _ = url.withUnsafeFileSystemRepresentation { path in
+                    "1".withCString { setxattr(path, "com.example.provider-state", $0, 1, 0, 0) }
+                }
+            }
+            return try await system.hashFile(url)
+        }
+        let plan = try samplePlan(source)
+        let report = await RequeueExecutor.publish(
+            decision: .publish(plan), plan: plan, sourceURL: source,
+            stagingRoot: fixture.root.appendingPathComponent("staging"),
+            targetDirectory: fixture.root.appendingPathComponent("target"),
+            openForWriting: false, effects: effects,
+            evaluate: { _ in uploadedEvaluation(identifier: "retry-1") },
+            maxPolls: 1, persist: { _ in }
+        )
+        #expect(try FileIntegrity.identity(source).changeTime != before.changeTime) // the fixture really changed metadata
+        #expect(report.outcome == .uploaded(itemIdentifier: "retry-1"))
     }
 
     @Test func testCrossVolumeBlocksBeforeCopy() async throws {
@@ -36,7 +64,7 @@ import Testing
             clones.increment()
             return true
         }
-        let plan = samplePlan()
+        let plan = try samplePlan(source)
         let report = await RequeueExecutor.publish(
             decision: .publish(plan),
             plan: plan,
@@ -45,7 +73,7 @@ import Testing
             targetDirectory: fixture.root.appendingPathComponent("target"),
             openForWriting: false,
             effects: effects,
-            evaluate: { _ in uploadedEvaluation(identifier: "should-not-run") }
+            evaluate: { _ in uploadedEvaluation(identifier: "should-not-run") }, persist: { _ in }
         )
         #expect(report.outcome == .blocked(.crossVolume))
         #expect(clones.value == 0)
@@ -59,7 +87,7 @@ import Testing
         effects.hashFile = { url in
             url.lastPathComponent == "original.mp4" ? "aaa" : "bbb"
         }
-        let plan = samplePlan()
+        let plan = try samplePlan(source)
         let report = await RequeueExecutor.publish(
             decision: .publish(plan),
             plan: plan,
@@ -68,7 +96,7 @@ import Testing
             targetDirectory: fixture.root.appendingPathComponent("target"),
             openForWriting: false,
             effects: effects,
-            evaluate: { _ in uploadedEvaluation(identifier: "nope") }
+            evaluate: { _ in uploadedEvaluation(identifier: "nope") }, persist: { _ in }
         )
         #expect(report.outcome == .blocked(.hashMismatch))
         let staged = fixture.root
@@ -81,7 +109,7 @@ import Testing
     @Test func testExistingDestinationDoesNotOverwrite() async throws {
         let fixture = try Scratch()
         let source = fixture.file("original.mp4", contents: Data("new".utf8))
-        let plan = samplePlan()
+        let plan = try samplePlan(source)
         let target = fixture.root.appendingPathComponent("target")
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
         let existing = target.appendingPathComponent(plan.retryFileName)
@@ -94,9 +122,9 @@ import Testing
             targetDirectory: target,
             openForWriting: false,
             effects: .system(),
-            evaluate: { _ in uploadedEvaluation(identifier: "nope") }
+            evaluate: { _ in uploadedEvaluation(identifier: "nope") }, persist: { _ in }
         )
-        guard case .blocked(.publishFailed) = report.outcome else {
+        guard case .blocked(.preparationFailed) = report.outcome else {
             Issue.record("Expected publish to stop, got \(report.outcome)")
             return
         }
@@ -110,7 +138,7 @@ import Testing
         let fixture = try Scratch()
         let source = fixture.file("original.mp4", contents: Data("episode-bytes".utf8))
         let responses = Responses(values: [uploading, uploadedEvaluation(identifier: "done-7")])
-        let plan = samplePlan()
+        let plan = try samplePlan(source)
         let report = await RequeueExecutor.publish(
             decision: .publish(plan),
             plan: plan,
@@ -120,7 +148,7 @@ import Testing
             openForWriting: false,
             effects: .system(),
             evaluate: { _ in await responses.next() },
-            maxPolls: 2
+            maxPolls: 2, persist: { _ in }
         )
         #expect(report.outcome == .uploaded(itemIdentifier: "done-7"))
     }
@@ -135,7 +163,7 @@ import Testing
             clones.increment()
             return try originalClone(source, destination)
         }
-        let plan = samplePlan()
+        let plan = try samplePlan(source)
         let report = await RequeueExecutor.publish(
             decision: .publish(plan),
             plan: plan,
@@ -148,22 +176,17 @@ import Testing
                 """
                 fileproviderItems = ( { isUploaded = 0; isDownloading = 0; isDownloaded = 1; uploadingError = "Error Domain=NSFileProviderErrorDomain Code=-2005 \\"(null)\\""; } );
                 """
-            }
+            }, persist: { _ in }
         )
         #expect(report.outcome == .retryFailed(code: -2005))
         #expect(clones.value == 1)
         #expect(try Data(contentsOf: source) == Data("episode-bytes".utf8))
     }
 
-    private func samplePlan() -> PublicationPlan {
+    private func samplePlan(_ url: URL) throws -> PublicationPlan {
         PublicationPlan(
             operationID: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
-            source: SourceVersionKey(
-                canonicalPath: "/tmp/original.mp4",
-                inode: 4,
-                fileSize: 13,
-                modificationTime: Date(timeIntervalSince1970: 10)
-            ),
+            source: try FileIntegrity.sourceVersion(url),
             retryFileName: "original.__requeued-20260923-204500.mp4",
             allowFullCopyFallback: true
         )
@@ -180,7 +203,7 @@ private struct Scratch {
     let root: URL
 
     init() throws {
-        root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
             .appendingPathComponent(".test-runs", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("target"), withIntermediateDirectories: true)

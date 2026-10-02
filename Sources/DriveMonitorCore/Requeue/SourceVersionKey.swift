@@ -22,6 +22,7 @@ public enum FindingDisposition: String, Codable, Sendable, CaseIterable {
     case requeueUploading
     case requeueSucceeded
     case requeueFailed
+    case recoveryRequired
     case ignored
     case resolved
     case sourceChanged
@@ -58,6 +59,7 @@ public enum RequeueBlockReason: Equatable, Sendable {
     case automaticDisabled
     case hashMismatch
     case publishFailed(stagedPath: String)
+    case preparationFailed(reason: String)
 }
 
 public enum RequeueDecision: Equatable, Sendable {

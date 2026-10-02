@@ -39,11 +39,11 @@ import Testing
     }
 
     @Test func testOnDiskStoreStaysOutsideCloudStorage() throws {
-        let repository = try FindingRepository(inMemory: false)
+        let directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try FindingRepository(inMemory: false, storageDirectory: directory)
         _ = repository
-        let store = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Synology Drive Unstuckerator/Store/Findings.store")
-        #expect(FileManager.default.fileExists(atPath: store.path))
-        #expect(!store.path.contains("CloudStorage"))
+        #expect(FileManager.default.fileExists(atPath: directory.appendingPathComponent("Findings.store").path))
+        #expect(!directory.path.contains("CloudStorage"))
     }
 }

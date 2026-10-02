@@ -23,7 +23,7 @@ public final class FSEventsDirectoryWatcher: DirectoryWatching, @unchecked Senda
     public func start(root: URL, handler: @escaping @Sendable (String) -> Void) throws {
         try lock.withLock {
             stopLocked()
-            let delivery = EventDelivery(handler: handler)
+            let delivery = EventDelivery(rootPath: root.path, handler: handler)
             var context = FSEventStreamContext(
                 version: 0,
                 info: Unmanaged.passUnretained(delivery).toOpaque(),
@@ -36,14 +36,18 @@ public final class FSEventsDirectoryWatcher: DirectoryWatching, @unchecked Senda
                 },
                 copyDescription: nil
             )
-            let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
+            let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagWatchRoot)
             guard let stream = FSEventStreamCreate(
                 kCFAllocatorDefault,
-                { _, context, count, paths, _, _ in
+                { _, context, count, paths, eventFlags, _ in
                     guard let context else { return }
                     let delivery = Unmanaged<EventDelivery>.fromOpaque(context).takeUnretainedValue()
                     let strings = paths.assumingMemoryBound(to: UnsafePointer<CChar>.self)
-                    for index in 0..<count { delivery.send(String(cString: strings[index])) }
+                    for index in 0..<count {
+                        let flags = eventFlags[index]
+                        let needsRescan = flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagRootChanged) != 0
+                        delivery.send(needsRescan ? delivery.rootPath : String(cString: strings[index]))
+                    }
                 },
                 &context,
                 [root.path] as CFArray,
@@ -82,9 +86,10 @@ public final class FSEventsDirectoryWatcher: DirectoryWatching, @unchecked Senda
 private final class EventDelivery: @unchecked Sendable {
     private let lock = NSLock()
     private var active = true
+    let rootPath: String
     private let handler: @Sendable (String) -> Void
 
-    init(handler: @escaping @Sendable (String) -> Void) { self.handler = handler }
+    init(rootPath: String, handler: @escaping @Sendable (String) -> Void) { self.rootPath = rootPath; self.handler = handler }
     func cancel() { lock.withLock { active = false } }
     func send(_ path: String) {
         // The engine also checks its generation after the asynchronous actor hop.

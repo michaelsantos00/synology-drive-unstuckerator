@@ -10,11 +10,11 @@ import Testing
             journals: [journal(.published, published: "/cloud/episode.__requeued-20260923-140311.mp4")]
         )
         FindingRequeue.apply(report, to: &finding, previousDisposition: .existingNeedsReview, now: Date(timeIntervalSince1970: 10))
-        #expect(finding.disposition == .requeueSucceeded)
+        #expect(finding.disposition == .requeueUploading)
         #expect(finding.attemptCount == 1)
         #expect(finding.retryItemIdentifier == "retry-item")
         #expect(finding.retryPath == "/cloud/episode.__requeued-20260923-140311.mp4")
-        #expect(finding.eligibilityBlockReason == "The uploaded copy will replace the failed original.")
+        #expect(finding.eligibilityBlockReason == "The original and retry must pass final integrity checks.")
     }
 
     @Test func testBlockedBeforeCopyDoesNotConsumeTheAttempt() {

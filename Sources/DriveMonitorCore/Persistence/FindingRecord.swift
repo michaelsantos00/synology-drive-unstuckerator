@@ -128,5 +128,12 @@ public struct ActivityEvent: Equatable, Sendable, Codable, Identifiable {
 public protocol FindingStoring: Sendable {
     func upsert(_ finding: FindingSnapshot) async throws
     func findings(matching disposition: FindingDisposition?) async throws -> [FindingSnapshot]
+    func findings(at path: String) async throws -> [FindingSnapshot]
     func append(_ event: ActivityEvent) async throws
+}
+
+public extension FindingStoring {
+    func findings(at path: String) async throws -> [FindingSnapshot] {
+        try await findings(matching: nil).filter { $0.canonicalPath == path }
+    }
 }
