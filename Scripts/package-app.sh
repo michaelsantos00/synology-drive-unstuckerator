@@ -8,8 +8,12 @@ APP_NAME="Synology Drive Unstuckerator"
 DEST="${1:-$HOME/Applications/$APP_NAME.app}"
 CONFIGURATION="${CONFIGURATION:-release}"
 
-swift build --package-path "$ROOT" --configuration "$CONFIGURATION" --product Unstuckerator
-BIN_DIR="$(swift build --package-path "$ROOT" --configuration "$CONFIGURATION" --product Unstuckerator --show-bin-path)"
+BUILD_OPTIONS=(--package-path "$ROOT" --configuration "$CONFIGURATION" --product Unstuckerator)
+if [[ -n "${SCRATCH_PATH:-}" ]]; then
+  BUILD_OPTIONS+=(--scratch-path "$SCRATCH_PATH")
+fi
+swift build "${BUILD_OPTIONS[@]}"
+BIN_DIR="$(swift build "${BUILD_OPTIONS[@]}" --show-bin-path)"
 BIN="$BIN_DIR/Unstuckerator"
 
 if [[ ! -x "$BIN" ]]; then

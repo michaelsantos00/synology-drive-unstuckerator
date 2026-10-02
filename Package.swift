@@ -40,6 +40,11 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "DriveMonitorUITests",
+            dependencies: ["DriveMonitorCore", "DriveMonitorUI"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
             name: "DriveMonitorCoreTests",
             dependencies: ["DriveMonitorCore"],
             resources: [
