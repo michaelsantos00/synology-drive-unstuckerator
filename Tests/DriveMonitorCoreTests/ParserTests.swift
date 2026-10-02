@@ -99,10 +99,9 @@ import Testing
             return
         }
         #expect(item.uploadingErrorCode == -2001)
-        guard case .incompatible = EvaluationClassification.classify(parsed) else {
-            Issue.record("Other numeric errors are not permanent failures")
-            return
-        }
+        // Readable and reported, but never the actionable permanent failure.
+        #expect(EvaluationClassification.classify(parsed) == .uploadError(domain: "NSFileProviderErrorDomain", code: -2001))
+        #expect(!FileProviderParser.isActionablePermanentFailure(item))
     }
 
     @Test func testQuotedIdentifier() {

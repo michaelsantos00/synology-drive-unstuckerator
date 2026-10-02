@@ -7,6 +7,8 @@ public enum ExecutionOutcome: Equatable, Sendable {
     case retryFailed(code: Int)
     case blocked(RequeueBlockReason)
     case verifying
+    case verificationFailed(String)
+    case recoveryRequired(String)
 }
 
 public struct ExecutionReport: Equatable, Sendable {
@@ -64,10 +66,7 @@ public struct RequeueEffects: Sendable {
                 try await FileIdentity.sha256(of: url)
             },
             moveFile: { source, destination in
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    throw RequeueIOError.destinationExists(destination.path)
-                }
-                try FileManager.default.moveItem(at: source, to: destination)
+                try FileIntegrity.moveExclusively(source, destination)
             },
             fileExists: { url in
                 FileManager.default.fileExists(atPath: url.path)
@@ -89,121 +88,188 @@ public enum RequeueIOError: Error, Equatable {
 
 public enum RequeueExecutor {
     public static func publish(
-        decision: RequeueDecision,
-        plan: PublicationPlan,
-        sourceURL: URL,
-        stagingRoot: URL,
-        targetDirectory: URL,
-        openForWriting: Bool,
-        effects: RequeueEffects,
+        decision: RequeueDecision, plan: PublicationPlan, sourceURL: URL, stagingRoot: URL,
+        targetDirectory: URL, openForWriting: Bool, effects: RequeueEffects,
         evaluate: @escaping @Sendable (String) async throws -> String,
-        maxPolls: Int = 1,
-        pollInterval: Duration = .zero,
-        onPublished: (@Sendable (String) async -> Void)? = nil
+        authorizePublication: @escaping @Sendable () async throws -> Void = {},
+        authorizeFullCopy: (@Sendable () async throws -> Bool)? = nil,
+        maxPolls: Int = 1, pollInterval: Duration = .zero,
+        persist: @escaping @Sendable (RequeueJournal) async throws -> Void
     ) async -> ExecutionReport {
         var journals: [RequeueJournal] = []
         let stagingDirectory = stagingRoot.appendingPathComponent(plan.operationID.uuidString, isDirectory: true)
-        let stagedFile = stagingDirectory.appendingPathComponent(plan.retryFileName)
-        let publishedFile = targetDirectory.appendingPathComponent(plan.retryFileName)
-
-        func record(_ phase: RequeuePhase, staged: String? = nil, published: String? = nil) {
-            journals.append(
-                RequeueJournal(
-                    id: plan.operationID,
-                    phase: phase,
-                    source: plan.source,
-                    stagedPath: staged,
-                    publishedPath: published,
-                    updatedAt: Date()
-                )
-            )
+        let staged = stagingDirectory.appendingPathComponent(plan.retryFileName)
+        let published = targetDirectory.appendingPathComponent(plan.retryFileName)
+        var journal = RequeueJournal(id: plan.operationID, phase: .planned, source: plan.source, updatedAt: Date())
+        func save(_ value: RequeueJournal) async throws {
+            try await persist(value)
         }
-
-        guard case .publish(let allowed) = decision, allowed == plan else {
-            record(.failed)
-            return ExecutionReport(outcome: .blocked(.notConfirmed), journals: journals)
+        guard case .publish(let allowed) = decision, allowed == plan, !openForWriting else {
+            return ExecutionReport(outcome: .blocked(openForWriting ? .openForWriting : .notConfirmed), journals: [])
         }
-        if openForWriting {
-            record(.failed)
-            return ExecutionReport(outcome: .blocked(.openForWriting), journals: journals)
-        }
-
-        record(.planned)
         do {
-            record(.stagingPrepared, staged: stagingDirectory.path)
-            try effects.makeDirectory(stagingDirectory)
-            // The destination is the user's Synology folder. Creating it would republish into a folder they removed.
-            guard effects.fileExists(targetDirectory) else {
-                record(.failed, staged: stagingDirectory.path)
-                return ExecutionReport(outcome: .blocked(.publishFailed(stagedPath: stagingDirectory.path)), journals: journals)
+            try await save(journal); journals.append(journal)
+            try Task.checkCancellation()
+            let before = try FileIntegrity.identity(sourceURL)
+            guard FileIntegrity.matches(before, source: plan.source) else {
+                throw MonitoringError.blocked(reason: "The original changed before copying.")
             }
-            // The move that must stay on one volume is staged file → destination, not the original → its parent.
-            let sameVolume = try effects.sameVolume(stagingDirectory, targetDirectory)
-            if !sameVolume {
-                record(.failed, staged: stagingDirectory.path)
+            journal.phase = .stagingPrepared; journal.stagedPath = staged.path
+            try await save(journal); journals.append(journal)
+            try effects.makeDirectory(stagingDirectory)
+            guard effects.fileExists(targetDirectory) else { throw RequeueIOError.destinationExists(targetDirectory.path) }
+            guard try effects.sameVolume(stagingDirectory, targetDirectory) else {
+                journal.phase = .failed
+                try await save(journal); journals.append(journal)
                 return ExecutionReport(outcome: .blocked(.crossVolume), journals: journals)
             }
-            let cloned = try effects.cloneFile(sourceURL, stagedFile)
-            if !cloned {
-                guard plan.allowFullCopyFallback else {
-                    record(.failed, staged: stagingDirectory.path)
-                    return ExecutionReport(outcome: .blocked(.crossVolume), journals: journals)
-                }
-                try effects.copyFile(sourceURL, stagedFile)
+            if try !effects.cloneFile(sourceURL, staged) {
+                if let authorizeFullCopy {
+                    guard try await authorizeFullCopy() else { throw RequeueIOError.cloneFailed }
+                } else if !plan.allowFullCopyFallback { throw RequeueIOError.cloneFailed }
+                try effects.copyFile(sourceURL, staged)
             }
-            record(.clonedOrCopied, staged: stagedFile.path)
-
+            journal.phase = .clonedOrCopied
+            try await save(journal); journals.append(journal)
             let sourceHash = try await effects.hashFile(sourceURL)
-            let stagedHash = try await effects.hashFile(stagedFile)
-            if sourceHash != stagedHash {
-                record(.failed, staged: stagedFile.path)
+            let stagedHash = try await effects.hashFile(staged)
+            // Change time moves on metadata-only updates (the provider's own xattrs); bytes are proven by the hashes.
+            guard sourceHash == stagedHash, try FileIntegrity.identity(sourceURL).sameContentMetadata(as: before) else {
+                journal.phase = .failed
+                try await save(journal); journals.append(journal)
                 return ExecutionReport(outcome: .blocked(.hashMismatch), journals: journals)
             }
-            record(.hashed, staged: stagedFile.path)
+            journal.sourceSHA256 = sourceHash; journal.retrySHA256 = stagedHash
+            journal.retryIdentity = try FileIntegrity.identity(staged)
+            journal.phase = .hashed
+            try await save(journal); journals.append(journal)
+            try Task.checkCancellation()
+            try await authorizePublication()
+            guard !effects.fileExists(published) else { throw RequeueIOError.destinationExists(published.path) }
+            journal.phase = .publishing; journal.publishedPath = published.path
+            // Persist destination intent before the move, so a crash cannot lose the retry's path.
+            try await save(journal); journals.append(journal)
+            try effects.moveFile(staged, published)
+            journal.retryIdentity = try FileIntegrity.identity(published)
+            journal.phase = .published
+            try await save(journal); journals.append(journal)
+        } catch {
+            let publishedOrUncertain = journal.phase == .publishing || journal.phase == .published
+            let reason = "Repair stopped: \(error.localizedDescription). Retained files are available in Recovery."
+            // Do not attempt another filesystem side effect after any persistence failure.
+            journal.message = reason
+            journal.phase = publishedOrUncertain ? .recoveryRequired : .failed
+            do { try await save(journal) } catch { journal.message = reason + " The operation record could not be updated." }
+            journals.append(journal)
+            return ExecutionReport(outcome: publishedOrUncertain ? .recoveryRequired(journal.message ?? reason)
+                : .blocked(.preparationFailed(reason: journal.message ?? reason)), journals: journals)
+        }
+        let verification = await verify(record: journal, effects: effects, evaluate: evaluate,
+            maxPolls: maxPolls, pollInterval: pollInterval, persist: persist)
+        return ExecutionReport(outcome: verification.outcome, journals: journals + verification.journals)
+    }
 
-            if effects.fileExists(publishedFile) {
-                record(.failed, staged: stagedFile.path)
-                return ExecutionReport(outcome: .blocked(.publishFailed(stagedPath: stagedFile.path)), journals: journals)
+    /// Also used after relaunch. The original commitment is never replaced with a fresh stat.
+    public static func verify(record: RequeueJournal, effects: RequeueEffects,
+        evaluate: @escaping @Sendable (String) async throws -> String,
+        maxPolls: Int = 1, pollInterval: Duration = .zero,
+        persist: @escaping @Sendable (RequeueJournal) async throws -> Void
+    ) async -> ExecutionReport {
+        var journal = record
+        guard [.published, .verifying, .uploadAcknowledged].contains(record.phase),
+              let path = record.publishedPath, var expected = record.retryIdentity,
+              let hash = record.retrySHA256, hash == record.sourceSHA256 else {
+            return ExecutionReport(outcome: .recoveryRequired("The saved retry evidence is incomplete. No new copy was made."), journals: [record])
+        }
+        let retry = URL(fileURLWithPath: path)
+        do {
+            let original = URL(fileURLWithPath: record.source.canonicalPath)
+            let originalIdentity = try FileIntegrity.identity(original)
+            guard FileIntegrity.matches(originalIdentity, source: record.source),
+                  try await VerifiedDigests.shared.verify(original, identity: originalIdentity, digest: hash, effects: effects) else {
+                journal.phase = .recoveryRequired
+                journal.message = "The original changed or is missing. Both versions were kept for recovery."
+                try await persist(journal)
+                return ExecutionReport(outcome: .recoveryRequired(journal.message!), journals: [journal])
             }
-            try effects.moveFile(stagedFile, publishedFile)
-            record(.published, staged: stagedFile.path, published: publishedFile.path)
-            if let onPublished {
-                await onPublished(publishedFile.path)
+            // Hash once before polling and again at acknowledgement. Waiting alone does not re-read GBs every 15 seconds,
+            // and a later check of unchanged files reuses this process's earlier result.
+            let retryIdentity = try FileIntegrity.identity(retry)
+            guard retryIdentity.sameContentMetadata(as: expected),
+                  try await VerifiedDigests.shared.verify(retry, identity: retryIdentity, digest: hash, effects: effects) else {
+                journal.phase = .recoveryRequired
+                journal.message = "The retry changed since publication. Review the retained versions."
+                try await persist(journal)
+                return ExecutionReport(outcome: .recoveryRequired(journal.message!), journals: [journal])
             }
-
-            record(.verifying, published: publishedFile.path)
-            for attempt in 0..<max(maxPolls, 0) {
-                if attempt > 0, pollInterval > .zero {
-                    try await Task.sleep(for: pollInterval)
-                }
+            expected = try FileIntegrity.identity(retry)
+            journal.retryIdentity = expected
+            var lastUploadError: String?
+            var consecutiveUploadErrors = 0
+            polling: for attempt in 0..<max(0, maxPolls) {
+                if attempt > 0, pollInterval > .zero { try await Task.sleep(for: pollInterval) }
                 try Task.checkCancellation()
-                let output = try await evaluate(publishedFile.path)
+                let current = try FileIntegrity.identity(retry)
+                guard current.sameContentMetadata(as: expected) else {
+                    journal.phase = .recoveryRequired
+                    journal.message = "The retry changed since publication. Review the retained versions."
+                    try await persist(journal)
+                    return ExecutionReport(outcome: .recoveryRequired(journal.message!), journals: [journal])
+                }
+                if current != expected {
+                    guard try await effects.hashFile(retry) == hash,
+                          try FileIntegrity.identity(retry).sameContentMetadata(as: current) else {
+                        journal.phase = .recoveryRequired
+                        journal.message = "The retry bytes changed. Review the retained versions."
+                        try await persist(journal)
+                        return ExecutionReport(outcome: .recoveryRequired(journal.message!), journals: [journal])
+                    }
+                    expected = try FileIntegrity.identity(retry)
+                    journal.retryIdentity = expected
+                    try await persist(journal)
+                }
+                let output = try await evaluate(path)
                 let parsed = FileProviderParser.parse(output)
                 switch EvaluationClassification.classify(parsed) {
                 case .uploaded:
-                    let identifier: String?
-                    if case .item(let item) = parsed {
-                        identifier = item.itemIdentifier
-                    } else {
-                        identifier = nil
+                    guard case .item(let item) = parsed,
+                          item.documentSize == nil || item.documentSize == expected.fileSize,
+                          try FileIntegrity.identity(retry).sameContentMetadata(as: expected),
+                          try await effects.hashFile(retry) == hash,
+                          try FileIntegrity.identity(retry).sameContentMetadata(as: expected) else {
+                        throw MonitoringError.blocked(reason: "The upload response could not be bound to the committed retry version.")
                     }
-                    record(.succeeded, published: publishedFile.path)
-                    return ExecutionReport(outcome: .uploaded(itemIdentifier: identifier), journals: journals)
+                    journal.retryIdentity = try FileIntegrity.identity(retry)
+                    journal.phase = .uploadAcknowledged; journal.uploadVerifiedAt = Date()
+                    journal.retryItemIdentifier = item.itemIdentifier; journal.message = nil
+                    try await persist(journal)
+                    return ExecutionReport(outcome: .uploaded(itemIdentifier: item.itemIdentifier), journals: [journal])
                 case .permanentFailure(_, let code):
-                    record(.failed, published: publishedFile.path)
-                    return ExecutionReport(outcome: .retryFailed(code: code), journals: journals)
+                    journal.phase = .published; journal.message = "Synology reports the retry also failed. No additional copy was made."
+                    try await persist(journal)
+                    return ExecutionReport(outcome: .retryFailed(code: code), journals: [journal])
                 case .incompatible:
-                    record(.failed, published: publishedFile.path)
-                    return ExecutionReport(outcome: .blocked(.incompatibleProviderOutput), journals: journals)
-                case .excluded, .syncPaused, .uploading, .notUploaded, .missingItem:
-                    continue
+                    throw MonitoringError.blocked(reason: "Provider output could not be interpreted safely.")
+                case .uploadError(let domain, let code):
+                    lastUploadError = "Synology reports upload error \(domain) \(code) for the retry. Waiting for it to clear; the original is still in place."
+                    consecutiveUploadErrors += 1
+                    // Offline or a full NAS can last hours. Stop holding this repair (which blocks others)
+                    // and let the background checks, which back off, keep watching.
+                    if consecutiveUploadErrors >= 4 { break polling }
+                default:
+                    lastUploadError = nil
+                    consecutiveUploadErrors = 0
                 }
             }
-            return ExecutionReport(outcome: .verifying, journals: journals)
+            journal.phase = .published; journal.message = lastUploadError
+            try await persist(journal)
+            return ExecutionReport(outcome: .verifying, journals: [journal])
         } catch {
-            let stagedPath = effects.fileExists(stagedFile) ? stagedFile.path : stagingDirectory.path
-            record(.failed, staged: stagedPath)
-            return ExecutionReport(outcome: .blocked(.publishFailed(stagedPath: stagedPath)), journals: journals)
+            // Publication already happened. An evaluation or storage error never undoes that fact.
+            if journal.phase != .recoveryRequired { journal.phase = .published }
+            journal.message = "Upload verification is incomplete: \(error.localizedDescription)"
+            do { try await persist(journal) } catch { journal.message! += " The operation record could not be updated." }
+            return ExecutionReport(outcome: journal.phase == .recoveryRequired ? .recoveryRequired(journal.message!) : .verificationFailed(journal.message!), journals: [journal])
         }
     }
 }
@@ -251,5 +317,34 @@ enum FileIdentity {
             throw RequeueIOError.cloneFailed
         }
         return number.uint64Value
+    }
+}
+
+/// Digests already confirmed in this process, keyed by full identity including change time.
+/// The kernel moves change time on every write and a writer cannot set it, so an identical
+/// identity means the bytes were not rewritten. Only repeat pre-checks use this: acknowledgement,
+/// finalization, and publication always read the bytes again.
+final class VerifiedDigests: @unchecked Sendable {
+    static let shared = VerifiedDigests()
+    private let lock = NSLock()
+    private var entries: [String: (identity: RetryFileIdentity, digest: String)] = [:]
+
+    func verify(_ url: URL, identity: RetryFileIdentity, digest: String, effects: RequeueEffects) async throws -> Bool {
+        let key = url.standardizedFileURL.path
+        if identity.changeTime != nil, lock.withLock({ entries[key] }).map({ $0.identity == identity && $0.digest == digest }) == true {
+            return true
+        }
+        guard try await effects.hashFile(url) == digest else {
+            _ = lock.withLock { entries.removeValue(forKey: key) }
+            return false
+        }
+        // Remember only an identity that held still while it was read.
+        if identity.changeTime != nil, try FileIntegrity.identity(url) == identity {
+            lock.withLock {
+                if entries.count > 256 { entries.removeAll() }
+                entries[key] = (identity, digest)
+            }
+        }
+        return true
     }
 }

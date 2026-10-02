@@ -1,10 +1,13 @@
 import Foundation
 
-/// Reads the first `fileproviderItems` dictionary from `fileproviderctl evaluate`.
+/// Reads one complete `fileproviderItems` dictionary from `fileproviderctl evaluate`.
 /// Unknown output is incompatible. Exit status is not success.
 
 public enum FileProviderParser {
     public static func parse(_ output: String) -> EvaluationParseResult {
+        guard output.utf8.count <= 1_048_576 else {
+            return .incompatible(reason: "Provider output exceeds the diagnostic limit")
+        }
         guard let itemsRange = output.range(of: "fileproviderItems") else {
             if isMissingItemMessage(output) {
                 return .missingItem
@@ -23,13 +26,17 @@ public enum FileProviderParser {
         }
 
         var items: [FileProviderItemState] = []
-        var failure: EvaluationParseResult?
+        var listClosed = false
+        var needsSeparator = false
         while !cursor.isAtEnd {
             cursor.skipWhitespace()
             if cursor.consume(")") {
+                listClosed = true
                 break
             }
-            if cursor.consume(",") {
+            if needsSeparator {
+                guard cursor.consume(",") else { return .incompatible(reason: "Items are missing a separator") }
+                needsSeparator = false
                 continue
             }
             guard cursor.peek() == "{" else {
@@ -38,19 +45,18 @@ public enum FileProviderParser {
             switch parseItem(from: &cursor) {
             case .item(let item):
                 items.append(item)
+                needsSeparator = true
             case .failed(let result):
-                failure = result
+                return result
             }
         }
 
-        if let failure, items.isEmpty {
-            return failure
+        cursor.skipWhitespace()
+        guard listClosed, cursor.consume(";") else {
+            return .incompatible(reason: "fileproviderItems did not close completely")
         }
         if items.count > 1 {
             return .incompatible(reason: "fileproviderItems contains more than one item")
-        }
-        if let failure {
-            return failure
         }
         guard let item = items.first else {
             return .missingItem
@@ -67,8 +73,8 @@ public enum FileProviderParser {
     public static func isActionablePermanentFailure(_ item: FileProviderItemState) -> Bool {
         item.isDownloaded == true
             && item.isUploaded == false
-            && item.isExcludedFromSync != true
-            && item.isSyncPaused != true
+            && item.isExcludedFromSync == false
+            && item.isSyncPaused == false
             && item.uploadingErrorDomain == "NSFileProviderErrorDomain"
             && item.uploadingErrorCode == -2005
     }
@@ -85,6 +91,7 @@ public enum FileProviderParser {
             return .failed(.incompatible(reason: "item dictionary did not open"))
         }
         var item = FileProviderItemState()
+        var seenSafetyFields: Set<String> = []
         while !cursor.isAtEnd {
             cursor.skipWhitespace()
             if cursor.consume("}") {
@@ -93,6 +100,9 @@ public enum FileProviderParser {
             guard let key = cursor.readIdentifier() else {
                 return .failed(.incompatible(reason: "item dictionary has an unreadable key"))
             }
+            if isSafetyField(key), !seenSafetyFields.insert(key).inserted {
+                return .failed(.incompatible(reason: "Duplicate safety field \(key)"))
+            }
             cursor.skipWhitespace()
             guard cursor.consume("=") else {
                 return .failed(.incompatible(reason: "item key \(key) has no value"))
@@ -100,11 +110,17 @@ public enum FileProviderParser {
             cursor.skipWhitespace()
             switch cursor.readValue() {
             case .text(let raw):
+                guard key != "uploadingError", validScalar(key: key, text: raw) else {
+                    return .failed(.incompatible(reason: "item key \(key) has an invalid value"))
+                }
                 apply(key: key, text: raw, to: &item)
             case .skipped where Self.isSafetyField(key):
                 // A dictionary or list where a flag or error string was expected must not look like success.
                 return .failed(.incompatible(reason: "item key \(key) has an unsupported value"))
             case .string(let raw):
+                guard validScalar(key: key, text: raw) else {
+                    return .failed(.incompatible(reason: "item key \(key) has an invalid value"))
+                }
                 apply(key: key, text: raw, to: &item)
                 if key == "uploadingError" {
                     item.uploadingErrorRaw = raw
@@ -124,7 +140,16 @@ public enum FileProviderParser {
     }
 
     private static func isSafetyField(_ key: String) -> Bool {
-        ["isUploaded", "isUploading", "isDownloaded", "uploadingError"].contains(key)
+        ["isUploaded", "isUploading", "isDownloaded", "isSyncPaused", "isExcludedFromSync", "uploadingError", "documentSize", "itemIdentifier", "parentItemIdentifier"].contains(key)
+    }
+
+    private static func validScalar(key: String, text: String) -> Bool {
+        if ["isUploaded", "isUploading", "isDownloaded", "isSyncPaused", "isExcludedFromSync"].contains(key) {
+            return boolean(text) != nil
+        }
+        if key == "documentSize" { return Int64(text).map { $0 >= 0 } ?? false }
+        if key == "itemIdentifier" || key == "parentItemIdentifier" { return !text.isEmpty }
+        return true
     }
 
     private static func apply(key: String, text: String, to item: inout FileProviderItemState) {
@@ -192,7 +217,12 @@ extension EvaluationClassification {
                 if domain == "NSFileProviderErrorDomain", code == -2005, item.isUploaded == false {
                     return .permanentFailure(domain: domain, code: code)
                 }
-                return .incompatible(reason: "upload error \(domain) \(code) is not a permanent sync failure")
+                // An error next to isUploaded = 1, or -2005 without isUploaded = 0, contradicts itself.
+                guard item.isUploaded == false, !(domain == "NSFileProviderErrorDomain" && code == -2005) else {
+                    return .incompatible(reason: "upload error \(domain) \(code) conflicts with the upload state")
+                }
+                // Readable, but not the failure this app repairs; often temporary (offline, quota, sign-in).
+                return .uploadError(domain: domain, code: code)
             }
             if item.uploadingErrorRaw != nil {
                 return .incompatible(reason: "uploadingError has no numeric code")
@@ -294,9 +324,8 @@ private struct Cursor {
     }
 
     mutating func skipBalanced() -> Bool {
-        guard let opening = peek(), opening == "{" || opening == "(" else { return false }
-        let closing: Character = opening == "{" ? "}" : ")"
-        var depth = 0
+        guard let first = peek(), first == "{" || first == "(" else { return false }
+        var closings: [Character] = []
         while !isAtEnd {
             if peek() == "\"" {
                 guard readString() != nil else { return false }
@@ -304,17 +333,16 @@ private struct Cursor {
             }
             let character = text[index]
             advance()
-            if character == opening {
-                depth += 1
-            } else if character == closing {
-                depth -= 1
-                if depth == 0 {
-                    return true
-                }
+            if character == "{" { closings.append("}") }
+            else if character == "(" { closings.append(")") }
+            else if character == "}" || character == ")" {
+                guard closings.popLast() == character else { return false }
+                if closings.isEmpty { return true }
             }
         }
         return false
     }
+
 }
 
 private enum ItemParse {

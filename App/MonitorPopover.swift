@@ -3,545 +3,368 @@ import DriveMonitorCore
 import ServiceManagement
 import SwiftUI
 
+public enum FindingQueue: String, CaseIterable, Identifiable {
+    case attention = "Attention", checking = "Checking", repairing = "Repairing", recent = "Recent"
+    public var id: String { rawValue }
+    public func includes(_ finding: FindingSnapshot) -> Bool {
+        switch self {
+        case .attention: [.actionable, .existingNeedsReview, .requeueFailed, .recoveryRequired, .compatibilityBlocked].contains(finding.disposition)
+            || finding.finalNameFailed
+        case .checking: finding.disposition == .observing
+        case .repairing: [.requeuePreparing, .requeueUploading].contains(finding.disposition)
+        // Earlier versions are history, not outcomes; Activity lists them separately.
+        case .recent: [.requeueSucceeded, .resolved].contains(finding.disposition) && !finding.finalNameFailed
+        }
+    }
+
+    var emptyTitle: String {
+        switch self {
+        case .attention: "Nothing needs attention"
+        case .checking: "Nothing is being checked"
+        case .repairing: "No repairs running"
+        case .recent: "No recent repairs"
+        }
+    }
+
+    var emptySymbol: String {
+        switch self {
+        case .attention: "checkmark.circle"
+        case .checking: "clock"
+        case .repairing: "arrow.triangle.2.circlepath"
+        case .recent: "tray"
+        }
+    }
+}
+
+/// The menu-bar panel: state at a glance, the few files that need a decision, and a way into Activity.
 public struct MonitorPopover: View {
     @Bindable var model: AppModel
     @Environment(\.openSettings) private var openSettings
-    @State private var confirmReset = false
-
+    @Environment(\.openWindow) private var openWindow
+    @State private var selectedGroup: FindingQueue = .attention
+    private static let rowLimit = 3
     public init(model: AppModel) { self.model = model }
+    private var visible: [FindingSnapshot] { model.queueFindings(selectedGroup) }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-
-            if let warning = model.lowDiskWarning {
-                notice(warning, color: .orange)
+        VStack(alignment: .leading, spacing: 0) {
+            header.padding(.horizontal, 14).padding(.top, 14).padding(.bottom, 12)
+            Group {
+                if model.isRestoring {
+                    // The header already shows progress; keep the panel short while saved state loads.
+                    EmptyView()
+                } else if model.needsRootConfirmation {
+                    setupCard
+                } else {
+                    content
+                }
             }
-            if let error = model.lastErrorText {
-                notice(error, color: .red)
-            }
-
-            ScrollView {
-                fileList
-            }
-            .scrollBounceBehavior(.basedOnSize)
-            .frame(maxHeight: max(160, menuHeightLimit - 200))
-            .fixedSize(horizontal: false, vertical: true)
-
-            if confirmReset {
-                resetConfirmation
-            } else {
-                toolbar
-            }
+            .padding(.horizontal, 14).padding(.bottom, 12)
+            Divider()
+            bottomBar.padding(.horizontal, 10).padding(.vertical, 8)
         }
-        .padding(18)
-        .frame(width: 500)
-        .frame(maxHeight: menuHeightLimit, alignment: .top)
-        .sheet(isPresented: Binding(
-            get: { !model.isRestoring && model.needsRootConfirmation },
-            set: { model.needsRootConfirmation = $0 }
-        )) { RootConfirmationView(model: model) }
+        .frame(width: 400)
+        // The menu-bar label installs this at launch; the panel installs it too in case the label did not.
+        .onAppear { if model.windowPresenter == nil { model.windowPresenter = { openWindow(id: $0.rawValue) } } }
     }
 
-    private var menuHeightLimit: CGFloat {
-        let screen = NSScreen.main?.visibleFrame.height ?? 900
-        return screen * 0.8
-    }
-
-    private var fileList: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if model.discoveredFindings.isEmpty {
-                Text("No files discovered yet.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 12)
-            }
-            ForEach(model.discoveredFindings) { finding in
-                AttentionRow(
-                    finding: finding,
-                    location: model.fileLocation(finding.canonicalPath),
-                    actionTitle: model.fileActionTitle(finding),
-                    actionEnabled: model.canRequeue(finding),
-                    action: { model.requeue(id: finding.id) },
-                    undoEnabled: model.canUndo(finding),
-                    undo: { model.undo(id: finding.id) },
-                    modelCanDismiss: model.canDismiss(finding),
-                    dismiss: { model.dismiss(id: finding.id) }
-                )
-            }
-        }
+    /// An app-modal alert: a dialog attached to the menu-bar panel can close with the panel when it takes focus.
+    private func confirmClearHistory() {
+        let alert = NSAlert()
+        alert.messageText = "Clear unprotected history?"
+        alert.informativeText = "Active repairs, recovery files, and Undo records stay available. Ignored files and files found at setup keep their status."
+        alert.addButton(withTitle: "Clear History").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate()
+        if alert.runModal() == .alertFirstButtonReturn { model.resetQueue() }
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 12) {
-            DockMark(side: 44)
-                .accessibilityLabel(model.status.accessibilityLabel)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Synology Drive Unstuckerator")
-                    .font(.headline)
-                Text(model.status.accessibilityLabel)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 10) {
+            DockMark(side: 34)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Synology Drive Unstuckerator").font(.headline).accessibilityAddTraits(.isHeader)
+                HStack(spacing: 5) {
+                    if model.isScanning || model.isRestoring {
+                        ProgressView().controlSize(.mini)
+                    } else if model.needsRootConfirmation {
+                        Image(systemName: "folder.badge.plus").foregroundStyle(.tint)
+                    } else if model.status == .healthy && model.lastScanDate == nil {
+                        Image(systemName: "clock").foregroundStyle(.secondary)
+                    } else {
+                        Image(systemName: model.status.filledSymbolName).foregroundStyle(model.status.tint)
+                    }
+                    Text(model.statusTitle)
+                }
+                .font(.subheadline)
+                .accessibilityElement(children: .combine)
+                if !model.needsRootConfirmation && !model.isRestoring {
+                    TimelineView(.everyMinute) { _ in
+                        Text(contextLine).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    .help(model.automaticScopeText)
+                }
             }
             Spacer(minLength: 0)
         }
     }
 
-    private var toolbar: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            glassGroup {
-                HStack(spacing: 8) {
-                    toolbarButton("Scan Now", systemImage: "arrow.clockwise", kind: .action) { model.scanNow() }
-                        .disabled(model.needsRootConfirmation || model.isScanning)
-                    toolbarButton(model.isPaused ? "Resume" : "Pause", systemImage: model.isPaused ? "play.fill" : "pause.fill", kind: .neutral) {
-                        model.togglePause()
+    private var contextLine: String {
+        let checked = model.lastScanDate.map { "Checked " + $0.formatted(.relative(presentation: .named)) } ?? "Not checked yet"
+        return [model.watchedFolderSummary, checked, model.automaticSummary].joined(separator: " · ")
+    }
+
+    @ViewBuilder private var content: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            notices
+            Picker("Show", selection: $selectedGroup) {
+                ForEach(FindingQueue.allCases) { group in
+                    Text("\(group.rawValue) \(model.queueFindings(group).count)").tag(group)
+                }
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            if visible.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: selectedGroup.emptySymbol).font(.title2).foregroundStyle(.secondary)
+                    Text(selectedGroup.emptyTitle).font(.callout).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 18)
+                .accessibilityElement(children: .combine)
+            } else {
+                VStack(spacing: 2) {
+                    ForEach(Array(visible.prefix(Self.rowLimit))) { finding in
+                        QueueRow(model: model, finding: finding)
                     }
-                    .disabled(model.needsRootConfirmation)
-                    toolbarButton("Reset", systemImage: "arrow.counterclockwise", kind: .destructive) { confirmReset = true }
-                        .disabled(model.needsRootConfirmation)
                 }
             }
-            if model.baselineNeedsReview {
-                Button("Acknowledge first-launch baseline") { model.acknowledgeBaseline() }
-                    .disabled(model.acknowledgingBaseline)
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Button(visible.count > Self.rowLimit ? "Show All \(visible.count) in Activity" : "Open Activity") {
+                model.showActivity(filter: ActivityFilter(queue: selectedGroup))
             }
-            HStack {
-                glassGroup {
-                    toolbarButton("Settings", systemImage: "gearshape", kind: .neutral) {
-                        NSApp.activate()
-                        openSettings()
-                    }
+            .buttonStyle(.link).font(.callout)
+        }
+    }
+
+    @ViewBuilder private var notices: some View {
+        if !model.unreadableOperationFiles.isEmpty {
+            NoticeView(symbol: "lock.trianglebadge.exclamationmark", tint: .red,
+                       text: "Repair is blocked by unreadable operation records. Monitoring continues.") {
+                Button("Review") { model.showActivity(filter: .recovery) }.controlSize(.small)
+            }
+        }
+        if let text = model.rootAvailabilityText {
+            NoticeView(symbol: "externaldrive.badge.exclamationmark", tint: .orange, text: text)
+        }
+        if let warning = model.lowDiskWarning {
+            NoticeView(symbol: "internaldrive", tint: .orange, text: warning)
+        }
+        if let error = model.lastErrorText {
+            NoticeView(symbol: "exclamationmark.octagon.fill", tint: .red, text: model.diagnosticText(error), lineLimit: 4) {
+                Button { model.dismissError() } label: {
+                    Label("Dismiss Error", systemImage: "xmark").frame(minWidth: 22, minHeight: 22).contentShape(Rectangle())
                 }
-                Spacer()
-                PowerButton()
+                .labelStyle(.iconOnly).buttonStyle(.borderless).help("Dismiss")
             }
         }
     }
 
-    private var resetConfirmation: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Clear discovered files?")
-                .font(.headline)
-            Text("This removes the list and activity history on this Mac. Files in Synology Drive stay where they are.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 8) {
-                glassTextButton("Cancel", kind: .neutral) { confirmReset = false }
-                Spacer()
-                glassTextButton("Reset Queue", kind: .destructive) {
-                    confirmReset = false
-                    model.resetQueue()
+    private var setupCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Pick a folder inside Synology Drive. Nested folders are included, and auto-fix starts off.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let error = model.lastErrorText {
+                NoticeView(symbol: "exclamationmark.octagon.fill", tint: .red, text: error, lineLimit: 4)
+            }
+            Button("Choose Folder…") { model.present(.welcome) }
+                .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private var bottomBar: some View {
+        HStack(spacing: 8) {
+            if model.needsRootConfirmation || model.isRestoring {
+                // Scanning and pausing mean nothing until a folder is watched.
+            } else {
+                // One button whose title and action switch, so keyboard and VoiceOver focus survive the change.
+                Button { model.isScanning ? model.cancelScan() : model.scanNow() } label: {
+                    Label(model.isScanning ? "Stop Scan" : "Scan Now", systemImage: model.isScanning ? "stop.fill" : "arrow.clockwise")
                 }
+                .keyboardShortcut(model.isScanning ? "." : "r", modifiers: .command)
+                .disabled(!model.isScanning && model.savingConfiguration)
+                .help(model.isScanning ? "Stop the scan in progress (⌘.)" : "Check watched folders now (⌘R)")
             }
+            if !model.needsRootConfirmation && !model.isRestoring {
+                Button { model.togglePause() } label: {
+                    Label(model.isPaused ? "Resume" : "Pause", systemImage: model.isPaused ? "play.fill" : "pause.fill")
+                }
+                .disabled(model.changingMonitoring || model.savingConfiguration || model.savingAutomaticSetting)
+                .help(model.isPaused ? "Resume scans and repairs" : "Pause scans and new repairs")
+            }
+            Spacer()
+            Button { model.showActivity() } label: { Label("Activity", systemImage: "list.bullet.rectangle") }
+                .labelStyle(.iconOnly).buttonStyle(.borderless).help("Activity and Recovery")
+            Button { NSApp.activate(); openSettings() } label: { Label("Settings…", systemImage: "gearshape") }
+                .labelStyle(.iconOnly).buttonStyle(.borderless).help("Settings (⌘,)")
+                .keyboardShortcut(",", modifiers: .command)
+            Menu {
+                Button("About Synology Drive Unstuckerator") {
+                    NSApp.activate()
+                    NSApp.orderFrontStandardAboutPanel(nil)
+                }
+                Button("Check for Updates on GitHub…") { NSWorkspace.shared.open(AppLinks.releases) }
+                Divider()
+                Button("Clear Unprotected History…") { confirmClearHistory() }
+                Divider()
+                Button("Quit Synology Drive Unstuckerator") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q", modifiers: .command)
+            } label: {
+                Label("More", systemImage: "ellipsis.circle")
+            }
+            .menuStyle(.button).buttonStyle(.borderless).menuIndicator(.hidden).labelStyle(.iconOnly).fixedSize()
+            .help("More")
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 32, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 32, style: .continuous).stroke(Color.primary.opacity(0.22), lineWidth: 1))
-    }
-
-    private func toolbarButton(_ title: String, systemImage: String, kind: MenuButtonKind, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.body.weight(.semibold))
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-        }
-        .buttonStyle(GlassButtonStyle(kind: kind))
-    }
-
-    private func glassTextButton(_ title: String, kind: MenuButtonKind, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .lineLimit(1)
-        }
-        .buttonStyle(GlassButtonStyle(kind: kind))
-    }
-
-    @ViewBuilder
-    private func glassGroup<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        if #available(macOS 26, *) {
-            GlassEffectContainer(spacing: 12) { content() }
-        } else {
-            content()
-        }
-    }
-
-    private func notice(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption)
-            .foregroundStyle(color)
-            .textSelection(.enabled)
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(color.opacity(0.18), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .buttonStyle(.bordered)
     }
 }
 
-struct AttentionRow: View {
+enum AppLinks {
+    static let releases = URL(string: "https://github.com/michaelsantos00/synology-drive-unstuckerator/releases")!
+}
+
+/// One file in the menu. The row opens its details in Activity; Fix and Undo stay one click away.
+struct QueueRow: View {
+    @Bindable var model: AppModel
     let finding: FindingSnapshot
-    var location: String
-    var actionTitle: String
-    var actionEnabled: Bool
-    var action: () -> Void
-    var undoEnabled: Bool = false
-    var undo: () -> Void = {}
-    var modelCanDismiss: Bool = false
-    var dismiss: () -> Void = {}
+    @State private var hovering = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(finding.filename)
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .textSelection(.enabled)
-                    .lineLimit(2)
-                Text(location)
-                    .font(.callout)
-                    .foregroundStyle(.primary)
-                    .textSelection(.enabled)
-                    .lineLimit(2)
-                StatusBadge(finding: finding)
-            }
-            glassGroup {
-                HStack(spacing: 8) {
-                    rowButton("Reveal", kind: .neutral) {
-                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: finding.canonicalPath)])
-                    }
-                    .accessibilityLabel("Reveal \(finding.filename) in Finder")
-                    Spacer(minLength: 8)
-                    if modelCanDismiss {
-                        rowButton("Dismiss", kind: .neutral) { dismiss() }
-                            .accessibilityLabel("Dismiss \(finding.filename)")
-                    }
-                    if undoEnabled {
-                        rowButton("Undo", kind: .action) { undo() }
-                            .accessibilityLabel("Undo the fix for \(finding.filename)")
-                    }
-                    if actionEnabled {
-                        Button(action: action) {
-                            HStack(spacing: 6) {
-                                MenuBarMark(height: 15)
-                                Text(actionTitle)
-                            }
-                            .font(.body.weight(.semibold))
-                            .lineLimit(1)
+        HStack(alignment: .center, spacing: 8) {
+            Button { model.showActivity(selecting: finding.id) } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: finding.statusSymbol).foregroundStyle(finding.statusTint).frame(width: 16)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(finding.filename).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                        Text("\(model.fileLocation(finding.canonicalPath)) · \(finding.sizeText)")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(statusLine).font(.caption).lineLimit(2)
+                        if let blockReason {
+                            // Primary color: this is the only visible reason Fix is unavailable.
+                            Text(blockReason).font(.caption).lineLimit(3)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .buttonStyle(GlassButtonStyle(kind: .action))
-                        .help("Fix only \(finding.filename).")
-                        .accessibilityLabel("\(actionTitle) \(finding.filename)")
                     }
+                    Spacer(minLength: 0)
                 }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help("\(finding.filename)\n\(model.pathText(finding.canonicalPath))\nClick to show details in Activity.")
+            .accessibilityHint("Shows this file’s details in the Activity window.")
+            // The context menu's actions, reachable without a pointer.
+            .accessibilityActions { FindingActions(model: model, finding: finding) }
+            actions
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.vertical, 6).padding(.horizontal, 6)
+        .background(hovering ? Color.primary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .onHover { hovering = $0 }
+        .contextMenu {
+            Button("Show Details") { model.showActivity(selecting: finding.id) }
+            FindingActions(model: model, finding: finding)
+        }
     }
 
-    private func rowButton(_ title: String, kind: MenuButtonKind, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.body.weight(.semibold))
-                .lineLimit(1)
-        }
-        .buttonStyle(GlassButtonStyle(kind: kind))
+    private var statusLine: String {
+        finding.disposition == .observing && finding.errorCode == -2005
+            ? "\(finding.statusText) · check \(finding.confirmationCount) of 2" : finding.statusText
     }
 
-    @ViewBuilder
-    private func glassGroup<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        if #available(macOS 26, *) {
-            GlassEffectContainer(spacing: 12) { content() }
-        } else {
-            content()
+    /// Why Fix is unavailable, shown where the row offers Fix but cannot run it.
+    private var blockReason: String? {
+        guard !model.canRequeue(finding),
+              [.observing, .actionable, .existingNeedsReview, .compatibilityBlocked].contains(finding.disposition) else { return nil }
+        return model.repairBlockReason(finding)
+    }
+
+    private var offersFix: Bool {
+        model.canRequeue(finding) || [.observing, .actionable, .existingNeedsReview, .requeuePreparing, .compatibilityBlocked].contains(finding.disposition)
+    }
+
+    @ViewBuilder private var actions: some View {
+        if model.canUndo(finding) {
+            Button("Undo") { model.undo(id: finding.id) }
+                .controlSize(.small)
+                .help("Restore the original and keep the replacement in Recovery")
+                .accessibilityLabel("Undo replacement of \(finding.filename)")
+        }
+        if offersFix {
+            Button(model.fileActionTitle(finding)) { model.requeue(id: finding.id) }
+                .buttonStyle(.borderedProminent).controlSize(.small)
+                .disabled(!model.canRequeue(finding))
+                .help(model.repairBlockReason(finding) ?? "Publish one verified copy for Synology to upload; the original is kept")
+                .accessibilityLabel("\(model.fileActionTitle(finding)) \(finding.filename)")
         }
     }
 }
 
-private struct StatusBadge: View {
-    @Environment(\.colorScheme) private var colorScheme
+/// Every file action in one place, so menus, rows, and the inspector stay consistent.
+struct FindingActions: View {
+    @Bindable var model: AppModel
     let finding: FindingSnapshot
 
     var body: some View {
-        Text(rowStatus(finding))
-            .font(.caption.weight(.bold))
-            .foregroundStyle(foreground)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(background, in: Capsule())
-            .accessibilityLabel(rowStatus(finding))
-    }
-
-    private var foreground: Color {
-        switch finding.disposition {
-        case .requeueSucceeded, .resolved:
-            colorScheme == .dark ? Color(red: 0.88, green: 1, blue: 0.9) : Color(red: 0.02, green: 0.24, blue: 0.08)
-        case .requeueFailed, .compatibilityBlocked:
-            colorScheme == .dark ? Color(red: 1, green: 0.9, blue: 0.9) : Color(red: 0.38, green: 0.02, blue: 0.02)
-        case .actionable, .existingNeedsReview, .requeuePreparing, .requeueUploading:
-            colorScheme == .dark ? Color(red: 1, green: 0.94, blue: 0.82) : Color(red: 0.32, green: 0.14, blue: 0)
-        default:
-            .primary
+        if model.canRequeue(finding) {
+            Button(model.fileActionTitle(finding)) { model.requeue(id: finding.id) }
         }
-    }
-
-    private var background: Color {
-        switch finding.disposition {
-        case .requeueSucceeded, .resolved:
-            colorScheme == .dark ? Color(red: 0.08, green: 0.38, blue: 0.18) : Color(red: 0.62, green: 0.9, blue: 0.68)
-        case .requeueFailed, .compatibilityBlocked:
-            colorScheme == .dark ? Color(red: 0.48, green: 0.08, blue: 0.08) : Color(red: 1, green: 0.72, blue: 0.72)
-        case .actionable, .existingNeedsReview, .requeuePreparing, .requeueUploading:
-            colorScheme == .dark ? Color(red: 0.55, green: 0.28, blue: 0) : Color(red: 1, green: 0.82, blue: 0.45)
-        default:
-            Color.primary.opacity(colorScheme == .dark ? 0.22 : 0.12)
+        if model.canUndo(finding) {
+            Button("Undo Replacement") { model.undo(id: finding.id) }
+        }
+        if ![.requeueUploading, .requeueSucceeded].contains(finding.disposition) {
+            Button("Check Again") { model.recheck(id: finding.id) }
+        }
+        Divider()
+        Button("Reveal in Finder") { Finder.reveal(finding) }
+        Button("Copy Diagnostic") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(model.copyDiagnostic(id: finding.id), forType: .string)
+        }
+        if !finding.hasRepairEvidence && !model.requeueInFlight.contains(finding.id) {
+            Divider()
+            if finding.disposition != .ignored {
+                Button("Ignore This Version") { model.ignore(id: finding.id) }
+            }
+            if finding.disposition != .resolved {
+                Button("Mark as Resolved") { model.markResolved(id: finding.id) }
+            }
         }
     }
 }
 
 struct LaunchAtLoginToggle: View {
     @Bindable var model: AppModel
-    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle(isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) })) {
-                Label("Launch at login", systemImage: "power.circle")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.primary)
+                Text("Open at login")
+                Text(statusLine)
             }
-            .toggleStyle(.switch)
             .disabled(model.changingLaunchAtLogin)
             .accessibilityHint("Opens Synology Drive Unstuckerator when you log in to this Mac.")
-            Text(statusLine)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(model.launchAtLoginNeedsApproval ? Color.orange : Color.primary.opacity(0.8))
             if model.launchAtLoginNeedsApproval {
-                Button("Allow in System Settings") {
+                Button("Allow in System Settings…") {
                     SMAppService.openSystemSettingsLoginItems()
                 }
-                .buttonStyle(ContrastButtonStyle())
             }
         }
-        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(colorScheme == .dark ? Color(white: 0.22) : Color.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.primary.opacity(0.28), lineWidth: 1))
         .onAppear { model.refreshLaunchAtLoginStatus() }
     }
 
     private var statusLine: String {
         if model.launchAtLoginNeedsApproval {
-            return "macOS needs approval before this opens at login."
+            return "macOS needs your approval before this opens at login."
         }
-        return model.launchAtLogin ? "Opens when you log in." : "Stays closed until you open it."
-    }
-}
-
-private enum MenuButtonKind {
-    case neutral
-    case action
-    case destructive
-
-    fileprivate var tint: Color? {
-        switch self {
-        case .neutral: nil
-        case .action: .blue
-        case .destructive: .red
-        }
-    }
-}
-
-private struct GlassButtonStyle: ButtonStyle {
-    var kind: MenuButtonKind = .neutral
-    var circle: Bool = false
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeBody(configuration: Configuration) -> some View {
-        let tone = GlassTone.resolve(kind.tint, scheme: colorScheme)
-        configuration.label
-            .font(.body.weight(.semibold))
-            .foregroundStyle(tone.label)
-            .lineLimit(1)
-            .padding(.horizontal, circle ? 11 : 16)
-            .padding(.vertical, circle ? 11 : 8)
-            .modifier(GlassWash(tint: tone.wash, circle: circle))
-            .opacity(isEnabled ? 1 : 0.45)
-            .opacity(configuration.isPressed ? 0.86 : 1)
-    }
-}
-
-private struct GlassWash: ViewModifier {
-    var tint: Color?
-    var circle: Bool
-
-    func body(content: Content) -> some View {
-        if #available(macOS 26, *) {
-            if let tint {
-                if circle {
-                    content.glassEffect(.regular.tint(tint).interactive(), in: .circle)
-                } else {
-                    content.glassEffect(.regular.tint(tint).interactive(), in: .capsule)
-                }
-            } else if circle {
-                content.glassEffect(.regular.interactive(), in: .circle)
-            } else {
-                content.glassEffect(.regular.interactive(), in: .capsule)
-            }
-        } else if let tint {
-            if circle {
-                content.background(tint, in: Circle())
-            } else {
-                content.background(tint, in: Capsule())
-            }
-        } else if circle {
-            content.background(Color.primary.opacity(0.08), in: Circle())
-        } else {
-            content.background(Color.primary.opacity(0.08), in: Capsule())
-        }
-    }
-}
-
-/// Turns a requested hue into a light glass wash, then picks label ink from that wash.
-private enum GlassTone {
-    static func resolve(_ tint: Color?, scheme: ColorScheme) -> (wash: Color?, label: Color) {
-        guard let tint else {
-            return (nil, .primary)
-        }
-        let ns = NSColor(tint).usingColorSpace(.sRGB) ?? .systemBlue
-        var red = ns.redComponent
-        var green = ns.greenComponent
-        var blue = ns.blueComponent
-        if scheme == .dark {
-            red = red * 0.42 + 0.10
-            green = green * 0.42 + 0.10
-            blue = blue * 0.42 + 0.12
-        } else {
-            red = red * 0.40 + 0.60
-            green = green * 0.40 + 0.60
-            blue = blue * 0.40 + 0.60
-        }
-        let wash = Color(red: red, green: green, blue: blue)
-        let luminance = 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
-        let label: Color = luminance > 0.42
-            ? Color(red: red * 0.20, green: green * 0.20, blue: blue * 0.16)
-            : .white
-        return (wash, label)
-    }
-
-    private static func linear(_ channel: CGFloat) -> CGFloat {
-        channel <= 0.04045 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
-    }
-}
-
-private struct PowerButton: View {
-    var body: some View {
-        Button {
-            NSApp.terminate(nil)
-        } label: {
-            Image(systemName: "power")
-                .font(.body.weight(.bold))
-        }
-        .buttonStyle(GlassButtonStyle(kind: .destructive, circle: true))
-        .keyboardShortcut("q", modifiers: .command)
-        .accessibilityLabel("Quit Synology Drive Unstuckerator")
-        .help("Quit Synology Drive Unstuckerator")
-    }
-}
-
-private struct ContrastButtonStyle: ButtonStyle {
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.isEnabled) private var isEnabled
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    func makeBody(configuration: Configuration) -> some View {
-        HoverChrome(reduceMotion: reduceMotion, pressed: configuration.isPressed) {
-            configuration.label
-                .font(.body.weight(.semibold))
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .foregroundStyle(colorScheme == .dark ? Color.white : Color.black)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(fill, in: Capsule())
-                .overlay(Capsule().strokeBorder(stroke, lineWidth: 1.5))
-        }
-        .opacity(isEnabled ? 1 : 0.45)
-    }
-
-    private var fill: Color {
-        colorScheme == .dark ? Color(white: 0.38) : Color.white
-    }
-
-    private var stroke: Color {
-        colorScheme == .dark ? Color.white.opacity(0.72) : Color.black.opacity(0.55)
-    }
-}
-
-private struct HoverChrome<Content: View>: View {
-    var reduceMotion: Bool
-    var pressed: Bool
-    @State private var hovering = false
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        content()
-            .scaleEffect(reduceMotion ? 1 : (pressed ? 0.96 : hovering ? 1.045 : 1))
-            .brightness(hovering && !pressed && !reduceMotion ? 0.05 : 0)
-            .onHover { hovering = $0 }
-            .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.7), value: hovering)
-            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.8), value: pressed)
-    }
-}
-
-private func outcomeColor(_ finding: FindingSnapshot) -> Color {
-    switch finding.disposition {
-    case .requeueSucceeded, .resolved: .green
-    case .requeueFailed, .compatibilityBlocked: .red
-    case .actionable, .existingNeedsReview, .requeuePreparing, .requeueUploading: .orange
-    case .observing, .sourceChanged, .ignored: .secondary
-    }
-}
-
-private func rowStatus(_ finding: FindingSnapshot) -> String {
-    switch finding.disposition {
-    case .requeueSucceeded:
-        return "Fixed · Synology reported the replacement uploaded"
-    case .requeueFailed:
-        return finding.eligibilityBlockReason ?? "Failed · the retry did not upload"
-    case .requeuePreparing, .requeueUploading:
-        return "Fixing this file"
-    case .observing where finding.errorCode == nil:
-        return finding.providerState
-    case .observing, .actionable, .existingNeedsReview:
-        return finding.errorCode == -2005 ? "Needs attention · permanent upload failure -2005" : finding.providerState
-    default:
-        return finding.providerState
-    }
-}
-
-struct RootConfirmationView: View {
-    @Bindable var model: AppModel
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Choose the folder to monitor").font(.title2.bold())
-            Text("Monitoring starts only after you choose a folder. Existing failures will be collected for review. Nested folders are included.")
-            if let error = model.lastErrorText { Text(error).foregroundStyle(.red) }
-            HStack {
-                Spacer()
-                Button("Choose Folder…") { model.chooseFolder() }.buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(24)
-        .frame(width: 490)
-        .interactiveDismissDisabled()
+        return model.launchAtLogin ? "Opens when you log in, so folders are watched without starting it yourself."
+            : "Stays closed until you open it."
     }
 }
 

@@ -1,107 +1,108 @@
 import Foundation
 
-/// After Synology reports the sibling uploaded, archives the original and renames the sibling.
-/// Stops if the original's inode, size, or modification time no longer match the verified version.
-
 public enum RetryNormalization: Equatable, Sendable {
     case replaced(URL)
+    case replacedWithWarning(URL, String)
     case leftInPlace(String)
     case originalRemoved(retryURL: URL, reason: String)
 }
 
-public struct RetryFileIdentity: Equatable, Sendable {
+public struct RetryFileIdentity: Equatable, Codable, Sendable {
     public var exists: Bool
     public var inode: UInt64
     public var fileSize: Int64
     public var modificationTime: Date
+    public var device: UInt64?
+    public var changeTime: Date?
 
-    public init(exists: Bool, inode: UInt64, fileSize: Int64, modificationTime: Date) {
+    public func sameContentMetadata(as other: RetryFileIdentity) -> Bool {
+        exists == other.exists && inode == other.inode && fileSize == other.fileSize && device == other.device
+            && abs(modificationTime.timeIntervalSince(other.modificationTime)) < 0.000001
+    }
+
+    public init(exists: Bool, inode: UInt64, fileSize: Int64, modificationTime: Date,
+                device: UInt64? = nil, changeTime: Date? = nil) {
         self.exists = exists
         self.inode = inode
         self.fileSize = fileSize
         self.modificationTime = modificationTime
+        self.device = device
+        self.changeTime = changeTime
     }
 }
 
-public struct RetryFinalizer {
-    public var identity: @Sendable (URL) throws -> RetryFileIdentity
-    public var remove: @Sendable (URL) throws -> Void
-    public var move: @Sendable (URL, URL) throws -> Void
+/// No destructive default: every original is archived, with durable evidence before each move.
+public struct RetryFinalizer: Sendable {
+    public var armExpiry: @Sendable (UUID, URL) throws -> Void = { try UndoArchive.armExpiry(id: $0, root: $1) }
+    public var move: @Sendable (URL, URL) throws -> Void = FileIntegrity.moveExclusively
+    public init() {}
+    public static func system() -> RetryFinalizer { RetryFinalizer() }
 
-    public init(
-        identity: @escaping @Sendable (URL) throws -> RetryFileIdentity,
-        remove: @escaping @Sendable (URL) throws -> Void,
-        move: @escaping @Sendable (URL, URL) throws -> Void
-    ) {
-        self.identity = identity
-        self.remove = remove
-        self.move = move
-    }
-
-    public static func system() -> RetryFinalizer {
-        RetryFinalizer(
-            identity: { url in
-                guard FileManager.default.fileExists(atPath: url.path) else {
-                    return RetryFileIdentity(exists: false, inode: 0, fileSize: 0, modificationTime: .distantPast)
-                }
-                let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-                guard let size = values.fileSize,
-                      let modified = values.contentModificationDate,
-                      let inode = attributes[.systemFileNumber] as? NSNumber else {
-                    throw RetryFinalizerError.unreadable(url.path)
-                }
-                return RetryFileIdentity(exists: true, inode: inode.uint64Value, fileSize: Int64(size), modificationTime: modified)
-            },
-            remove: { url in
-                try FileManager.default.removeItem(at: url)
-            },
-            move: { source, destination in
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    throw RetryFinalizerError.destinationOccupied(destination.path)
-                }
-                try FileManager.default.moveItem(at: source, to: destination)
-            }
-        )
-    }
-
-    public func finish(
-        original: URL,
-        retry: URL,
-        expectedInode: UInt64,
-        expectedSize: Int64,
-        expectedModified: Date
-    ) -> RetryNormalization {
-        if original.resolvingSymlinksInPath().path == retry.resolvingSymlinksInPath().path {
-            return .leftInPlace("The retry path is the original file, so nothing was deleted.")
+    public func finish(record: RequeueJournal, undoRoot: URL,
+                       persist: @Sendable (RequeueJournal) throws -> Void) -> RetryNormalization {
+        let original = URL(fileURLWithPath: record.source.canonicalPath)
+        guard let retryPath = record.publishedPath,
+              record.phase == .uploadAcknowledged, record.uploadVerifiedAt != nil,
+              let sourceHash = record.sourceSHA256, let retryHash = record.retrySHA256,
+              sourceHash == retryHash, let expectedRetry = record.retryIdentity else {
+            return .leftInPlace("Repair evidence is incomplete. Review the retained files before continuing.")
         }
-        do {
-            let retryIdentity = try identity(retry)
-            guard retryIdentity.exists else {
-                return .leftInPlace("The uploaded copy is missing, so the original was kept.")
-            }
-            let originalIdentity = try identity(original)
-            guard originalIdentity.exists else {
-                return .leftInPlace("The original file is already gone.")
-            }
-            guard originalIdentity.inode == expectedInode,
-                  originalIdentity.fileSize == expectedSize,
-                  abs(originalIdentity.modificationTime.timeIntervalSince(expectedModified)) < 1,
-                  originalIdentity.inode != retryIdentity.inode else {
-                return .leftInPlace("The original file changed after the copy was made, so it was kept.")
-            }
-            try remove(original)
-        } catch {
-            return .leftInPlace("The original could not be removed: \(error.localizedDescription)")
+        let retry = URL(fileURLWithPath: retryPath)
+        guard original.standardizedFileURL != retry.standardizedFileURL else {
+            return .leftInPlace("The original and retry paths must be different.")
         }
+        var journal = record
         do {
-            try move(retry, original)
-            return .replaced(original)
+            return try FileIntegrity.coordinated(original: original, retry: retry) { original, retry in
+                let sourceIdentity = try FileIntegrity.identity(original)
+                guard FileIntegrity.matches(sourceIdentity, source: record.source),
+                      try FileIntegrity.identity(retry).sameContentMetadata(as: expectedRetry),
+                      sourceIdentity.inode != expectedRetry.inode,
+                      try FileIntegrity.sha256(original) == sourceHash,
+                      try FileIntegrity.sha256(retry) == retryHash,
+                      try FileIntegrity.identity(original).sameContentMetadata(as: sourceIdentity),
+                      try FileIntegrity.identity(retry).sameContentMetadata(as: expectedRetry) else {
+                    return .leftInPlace("A file changed after publication or verification. Both versions were kept for review.")
+                }
+                let archiveID = UUID()
+                journal.archiveID = archiveID
+                journal.phase = .archiving
+                journal.updatedAt = Date()
+                try persist(journal)
+                _ = try UndoArchive.store(file: original, findingID: record.finding?.id, root: undoRoot,
+                    id: archiveID, operationID: record.id, expectedReplacementSHA256: retryHash,
+                    archivedSHA256: sourceHash)
+                journal.phase = .archived
+                try persist(journal)
+                // A crash here intentionally requires recovery; never infer permission from a missing path.
+                guard !(try FileIntegrity.identity(original)).exists,
+                      try FileIntegrity.identity(retry).sameContentMetadata(as: expectedRetry),
+                      try FileIntegrity.sha256(retry) == retryHash else {
+                    throw RetryFinalizerError.destinationOccupied(original.path)
+                }
+                journal.phase = .finalizing
+                try persist(journal)
+                try move(retry, original)
+                guard try FileIntegrity.sha256(original) == retryHash else {
+                    throw RetryFinalizerError.unreadable(original.path)
+                }
+                journal.phase = .succeeded
+                journal.updatedAt = Date()
+                try persist(journal)
+                // New operations retain the original until the final filename is acknowledged.
+                guard journal.finalPathVerificationRequired != true else { return .replaced(original) }
+                do { try armExpiry(archiveID, undoRoot) }
+                catch {
+                    return .replacedWithWarning(original, "Placement completed. The Undo expiry update could not be confirmed; review retention in Activity → Recovery.")
+                }
+                return .replaced(original)
+            }
         } catch {
-            return .originalRemoved(
-                retryURL: retry,
-                reason: "The failed original was removed, but the uploaded copy could not be renamed. It is still at \(retry.path). \(error.localizedDescription)"
-            )
+            let reason = "Final placement stopped: \(error.localizedDescription). Review the original, retry, and recovery archive."
+            if record.archiveID != nil || journal.archiveID != nil {
+                return .originalRemoved(retryURL: retry, reason: reason)
+            }
+            return .leftInPlace(reason)
         }
     }
 }

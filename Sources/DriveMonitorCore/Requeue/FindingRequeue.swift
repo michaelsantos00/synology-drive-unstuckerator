@@ -31,6 +31,8 @@ public enum RequeueExplanation {
             "Automatic requeue is turned off."
         case .hashMismatch:
             "The staged copy did not match the original, so it was not moved into the Synology folder. The original file was not changed."
+        case .preparationFailed(let reason):
+            reason
         case .publishFailed(let stagedPath):
             "The retry copy could not be published. The staged file is still at \(stagedPath). The original file was not changed."
         }
@@ -47,40 +49,113 @@ public enum FindingRequeue {
         if let published = report.journals.last(where: { $0.publishedPath != nil })?.publishedPath {
             finding.retryPath = published
         }
-        let copyWasMade = report.journals.contains {
-            switch $0.phase {
-            case .clonedOrCopied, .hashed, .published, .verifying, .succeeded:
-                true
-            case .planned, .stagingPrepared, .failed, .ignored:
-                false
-            }
+        let copyWasMade = report.journals.contains { $0.sourceSHA256 != nil || $0.phase == .clonedOrCopied }
+        if let record = report.journals.last {
+            finding.sourceSHA256 = record.sourceSHA256 ?? finding.sourceSHA256
+            finding.retrySHA256 = record.retrySHA256 ?? finding.retrySHA256
         }
         switch report.outcome {
         case .uploaded(let identifier):
-            finding.disposition = .requeueSucceeded
+            finding.disposition = .requeueUploading
             finding.retryItemIdentifier = identifier
             finding.uploadVerifiedAt = now
-            finding.attemptCount += 1
-            finding.providerState = "Synology reports the retry uploaded"
-            finding.eligibilityBlockReason = "The uploaded copy will replace the failed original."
+            finding.attemptCount = max(1, finding.attemptCount)
+            finding.providerState = "Upload verified; final placement pending"
+            finding.eligibilityBlockReason = "The original and retry must pass final integrity checks."
         case .retryFailed(let code):
-            finding.disposition = .requeueFailed
-            finding.attemptCount += 1
+            finding.disposition = .requeueUploading
+            finding.attemptCount = max(1, finding.attemptCount)
             finding.errorDomain = "NSFileProviderErrorDomain"
             finding.errorCode = code
-            finding.providerState = "The retry copy also failed"
-            finding.eligibilityBlockReason = "No further copy was created. The original file was left in place."
-        case .verifying:
+            finding.providerState = "The published retry also failed"
+            finding.eligibilityBlockReason = "Check upload verifies the existing retry. No additional copy will be created."
+        case .verifying, .verificationFailed:
             finding.disposition = .requeueUploading
-            finding.attemptCount += 1
-            finding.providerState = "Waiting for Synology to report the retry uploaded"
-            finding.eligibilityBlockReason = "The complete retry copy is in the folder. The original file was not changed."
+            finding.attemptCount = max(1, finding.attemptCount)
+            finding.providerState = "Waiting for upload verification"
+            if case .verificationFailed(let message) = report.outcome { finding.eligibilityBlockReason = message }
+            else { finding.eligibilityBlockReason = report.journals.last?.message ?? "The retry is published. The original is still in place." }
+        case .recoveryRequired(let reason):
+            finding.disposition = .recoveryRequired
+            finding.providerState = "Recovery review required"
+            finding.eligibilityBlockReason = reason
         case .blocked(let reason):
-            if copyWasMade { finding.attemptCount += 1 }
+            if copyWasMade { finding.attemptCount = max(1, finding.attemptCount) }
             finding.disposition = copyWasMade ? .requeueFailed : previousDisposition
-            finding.providerState = copyWasMade ? "Requeue stopped after a copy was made" : "Requeue stopped before copying"
+            finding.providerState = "Repair stopped"
             finding.eligibilityBlockReason = RequeueExplanation.message(reason)
         }
         finding.lastCheckedAt = now
+    }
+
+    public static func snapshot(for journal: RequeueJournal, fallback: FindingSnapshot) -> FindingSnapshot {
+        var finding = journal.finding ?? fallback
+        finding.sourceSHA256 = journal.sourceSHA256
+        finding.retrySHA256 = journal.retrySHA256
+        finding.retryPath = journal.publishedPath
+        finding.retryItemIdentifier = journal.retryItemIdentifier
+        finding.uploadVerifiedAt = journal.uploadVerifiedAt
+        finding.lastCheckedAt = journal.updatedAt
+        finding.eligibilityBlockReason = journal.message
+        switch journal.phase {
+        case .planned, .stagingPrepared, .clonedOrCopied, .hashed, .publishing:
+            finding.disposition = .requeuePreparing
+            finding.providerState = journal.phase == .hashed ? "Copy verified" : "Preparing a retry copy"
+        case .published, .verifying, .uploadAcknowledged, .archiving, .archived, .finalizing:
+            finding.disposition = .requeueUploading
+            finding.attemptCount = max(1, finding.attemptCount)
+            finding.providerState = journal.phase == .uploadAcknowledged ? "Upload verified; final placement pending" : "Retry published; awaiting verification"
+        case .succeeded:
+            // Track the replacement's identity, so our own rename cannot look like
+            // a new user export and become eligible for another automatic retry.
+            if let identity = journal.retryIdentity {
+                finding.inode = identity.inode
+                finding.fileSize = identity.fileSize
+                finding.modificationDate = identity.modificationTime
+            }
+            finding.disposition = .requeueSucceeded
+            finding.retryPath = finding.canonicalPath
+            finding.providerState = journal.finalPathVerifiedAt != nil ? "Final filename reports uploaded; local content verified"
+                : journal.finalPathError != nil ? finalNameFailedState : "Replacement placed locally; final-name upload not verified"
+            finding.eligibilityBlockReason = journal.message ?? (journal.finalPathVerifiedAt != nil
+                ? "The original is retained for Undo. This is provider acknowledgment, not an independent NAS checksum."
+                : "The uploaded retry was placed at the original name. Check final name to verify its provider state; the original remains retained.")
+        case .failed:
+            finding.disposition = .requeueFailed
+            finding.providerState = "Repair stopped before publication"
+        case .undone:
+            finding.disposition = .resolved
+            finding.providerState = "Original restored; retained copy is in Recovery"
+        case .ignored:
+            finding.disposition = .ignored
+        case .recoveryRequired:
+            finding.disposition = .recoveryRequired
+            finding.providerState = "Recovery review required"
+            if finding.eligibilityBlockReason == nil { finding.eligibilityBlockReason = "An interrupted operation needs review. No additional copy will be created." }
+        }
+        return finding
+    }
+}
+
+public extension FindingRequeue {
+    /// Provider state of a placed replacement whose final filename Synology reports as failing.
+    static let finalNameFailedState = "Final filename upload failed"
+}
+
+public extension FindingSnapshot {
+    /// The replacement is in place but did not upload under its final name; it needs a decision.
+    var finalNameFailed: Bool { disposition == .requeueSucceeded && providerState == FindingRequeue.finalNameFailedState }
+
+    var hasRepairEvidence: Bool {
+        retryPath != nil || [.requeuePreparing, .requeueUploading, .recoveryRequired].contains(disposition)
+    }
+}
+
+public enum ManualRepairEligibility {
+    public static func canStart(_ finding: FindingSnapshot, now: Date = Date()) -> Bool {
+        guard !finding.hasRepairEvidence else { return false }
+        if [.actionable, .existingNeedsReview].contains(finding.disposition) { return true }
+        return finding.disposition == .observing && finding.errorCode == -2005 && finding.confirmationCount > 0
+            && now.timeIntervalSince(finding.lastConfirmedAt ?? finding.firstDetectedAt) >= 60
     }
 }

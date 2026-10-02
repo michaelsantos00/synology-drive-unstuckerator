@@ -12,7 +12,9 @@ Read [docs/safety.md](docs/safety.md). The rules there are the product. A change
 swift test
 ```
 
-The deployment target is macOS 15. Building needs Swift 6.2 and the macOS 26 SDK (Xcode 26 or later), because Liquid Glass is referenced behind an availability check. Keep newer system APIs behind a check so the app still runs on macOS 15.
+Inside a synced checkout (Synology Drive adds file attributes that break code signing of build products), use `swift test --scratch-path /private/tmp/unstuckerator-build`.
+
+The deployment target is macOS 15. Building needs Swift 6.2 and a macOS SDK supporting macOS 15. Keep newer system APIs behind a check so the app still runs on macOS 15.
 
 Comments should explain a constraint or an invariant a reader cannot see from the names.
 

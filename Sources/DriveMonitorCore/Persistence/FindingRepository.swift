@@ -183,13 +183,13 @@ public final class StoredRoot {
 
 @ModelActor
 public actor FindingRepository: FindingStoring {
-    public init(inMemory: Bool) throws {
+    public init(inMemory: Bool, storageDirectory: URL? = nil) throws {
         let schema = Schema([StoredFinding.self, StoredActivity.self, StoredRoot.self])
         let configuration: ModelConfiguration
         if inMemory {
             configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true, cloudKitDatabase: .none)
         } else {
-            let directory = try AppStorage.folderURL().appendingPathComponent("Store", isDirectory: true)
+            let directory = try storageDirectory ?? AppStorage.folderURL().appendingPathComponent("Store", isDirectory: true)
             let store = directory.appendingPathComponent("Findings.store")
             // Refuse redirected storage rather than risk writing into a synced folder or a checkout.
             guard !store.pathComponents.contains("CloudStorage"),
@@ -223,6 +223,16 @@ public actor FindingRepository: FindingStoring {
         return try modelContext.fetch(query).map { try $0.snapshot() }
     }
 
+    public func findings(at path: String) async throws -> [FindingSnapshot] {
+        let query = FetchDescriptor<StoredFinding>(predicate: #Predicate { $0.canonicalPath == path },
+            sortBy: [SortDescriptor(\.lastCheckedAt, order: .reverse)])
+        return try modelContext.fetch(query).map { try $0.snapshot() }
+    }
+
+    public func finding(id: UUID) async throws -> FindingSnapshot? {
+        try modelContext.fetch(FetchDescriptor<StoredFinding>(predicate: #Predicate { $0.id == id })).first?.snapshot()
+    }
+
     public func append(_ event: ActivityEvent) async throws {
         let id = event.id
         let query = FetchDescriptor<StoredActivity>(predicate: #Predicate { $0.id == id })
@@ -241,13 +251,49 @@ public actor FindingRepository: FindingStoring {
             .map { $0.snapshot() }
     }
 
-    public func eraseDiscoveredItems() async throws {
+    /// Rows that record a decision rather than an observation. Erasing them would let the same file
+    /// come back as a new, auto-fixable failure.
+    public static func isDecision(_ disposition: FindingDisposition) -> Bool {
+        [.ignored, .existingNeedsReview].contains(disposition)
+    }
+
+    public func eraseDiscoveredItems(preserving ids: Set<UUID> = []) async throws {
         for item in try modelContext.fetch(FetchDescriptor<StoredFinding>()) {
-            modelContext.delete(item)
+            let finding = try item.snapshot()
+            if !ids.contains(item.id), !finding.hasRepairEvidence, !Self.isDecision(finding.disposition) { modelContext.delete(item) }
         }
         for item in try modelContext.fetch(FetchDescriptor<StoredActivity>()) {
-            modelContext.delete(item)
+            if item.findingID.map(ids.contains) != true { modelContext.delete(item) }
         }
+        try persist()
+    }
+
+    /// Replaces configuration in one store transaction, preserving finding history.
+    public func replaceRoots(_ roots: [WatchedRootSnapshot]) async throws {
+        guard Set(roots.map(\.id)).count == roots.count else {
+            throw MonitoringError.blocked(reason: "Watched root identifiers must be unique.")
+        }
+        do {
+            for stored in try modelContext.fetch(FetchDescriptor<StoredRoot>()) { modelContext.delete(stored) }
+            for root in roots { modelContext.insert(StoredRoot(root)) }
+            try persist()
+        } catch { modelContext.rollback(); throw error }
+    }
+
+    public func events(limit: Int, offset: Int = 0) async throws -> [ActivityEvent] {
+        var query = FetchDescriptor<StoredActivity>(sortBy: [SortDescriptor(\.timestamp, order: .reverse)])
+        query.fetchLimit = max(1, limit)
+        query.fetchOffset = max(0, offset)
+        return try modelContext.fetch(query).map { try $0.snapshot() }
+    }
+
+    /// Writes only the review date, so a configuration saved while the review was in flight is kept.
+    public func setBaseline(rootID: UUID, at date: Date) async throws {
+        let query = FetchDescriptor<StoredRoot>(predicate: #Predicate { $0.id == rootID })
+        guard let stored = try modelContext.fetch(query).first else {
+            throw MonitoringError.blocked(reason: "The watched root is unavailable.")
+        }
+        stored.baselineCompletedAt = date
         try persist()
     }
 
@@ -256,6 +302,18 @@ public actor FindingRepository: FindingStoring {
         let query = FetchDescriptor<StoredRoot>(predicate: #Predicate { $0.id == id })
         if let stored = try modelContext.fetch(query).first { stored.update(from: root) }
         else { modelContext.insert(StoredRoot(root)) }
+        try persist()
+    }
+
+    /// Activity is history; operation records are the evidence. Routine scan rows (one every few minutes)
+    /// age out after a week and everything else after the retention window, so the log stays bounded.
+    public func pruneEvents(now: Date = Date(), scanRetention: TimeInterval = 7 * 86_400,
+                            retention: TimeInterval = 180 * 86_400) async throws {
+        let cutoff = now.addingTimeInterval(-retention), scanCutoff = now.addingTimeInterval(-scanRetention)
+        let scan = ActivityKind.scan.rawValue
+        try modelContext.delete(model: StoredActivity.self, where: #Predicate {
+            $0.timestamp < cutoff || ($0.kindRawValue == scan && $0.timestamp < scanCutoff)
+        })
         try persist()
     }
 

@@ -1,282 +1,271 @@
 import DriveMonitorCore
 import Foundation
 
-/// Manual Fix. Re-checks the provider before copying, and a later attempt verifies an already published sibling.
+/// Dependencies are explicit so integration tests never open the production store or run a provider command.
 enum ManualRequeueAction {
-    static func perform(id: UUID, repository: FindingRepository) async throws -> FindingSnapshot {
-        let known = try await repository.findings(matching: nil)
-        guard var finding = known.first(where: { $0.id == id }) else {
+    struct Environment: Sendable {
+        var onProgress: @Sendable (FindingSnapshot) async -> Void = { _ in }
+        var operations: RepairOperationStore
+        var access: RepairAccess
+        var stagingRoot: URL
+        var undoRoot: URL
+        var runner: any CommandRunning = ProcessCommandRunner()
+        var effects: RequeueEffects = .system()
+        var maxPolls = 240
+        var pollInterval: Duration = .seconds(15)
+        var writeProbe: @Sendable (String) async -> Bool? = { path in
+            try? await SystemOpenWriteProbe().isOpenForWriting(path: path)
+        }
+        var availableBytes: @Sendable (URL) throws -> Int64 = {
+            try $0.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
+        }
+    }
+
+    static func perform(id: UUID, repository: FindingRepository, environment: Environment,
+                        mode: RequeueMode = .manual,
+                        automaticAllowed: @escaping @Sendable () async -> Bool = { false }) async throws -> FindingSnapshot {
+        guard let finding = try await repository.finding(id: id) else {
             throw MonitoringError.blocked(reason: "That finding is no longer available.")
         }
-        let previousDisposition = finding.disposition
+        return try await environment.access.withAccess(to: finding.canonicalPath) {
+            try await performLocked(id: id, repository: repository, environment: environment,
+                                    mode: mode, automaticAllowed: automaticAllowed)
+        }
+    }
+
+    private static func performLocked(id: UUID, repository: FindingRepository, environment env: Environment,
+                                      mode: RequeueMode,
+                                      automaticAllowed: @escaping @Sendable () async -> Bool) async throws -> FindingSnapshot {
+        guard var finding = try await repository.finding(id: id) else {
+            throw MonitoringError.blocked(reason: "That finding is no longer available.")
+        }
         let sourceURL = URL(fileURLWithPath: finding.canonicalPath)
-        let live = try liveIdentity(sourceURL)
-        let recorded = SourceVersionKey(
-            canonicalPath: live.canonicalPath,
-            inode: finding.inode ?? live.inode,
-            fileSize: finding.fileSize,
-            modificationTime: finding.modificationDate
-        )
-        let sameVersion = (finding.inode == nil || finding.inode == live.inode)
-            && finding.fileSize == live.fileSize
-            && abs(finding.modificationDate.timeIntervalSince(live.modificationTime)) < 1
-        if finding.disposition == .requeueUploading, let retryPath = finding.retryPath {
-            return try await resumeVerification(finding: finding, retryPath: retryPath, live: live, repository: repository)
+        var automaticRoot: WatchedRootSnapshot?
+        if mode == .automatic {
+            automaticRoot = try await repository.roots().first { $0.id == finding.rootIdentifier }
+            guard let root = automaticRoot, root.enabled, root.automaticRequeueEnabled,
+                  let baseline = root.baselineCompletedAt, finding.firstDetectedAt >= baseline,
+                  !AutomaticRepairCoordinator.predatesReview(finding, root: root),
+                  sourceURL.path.hasPrefix(root.path + "/"), root.minimumStableAge.isFinite,
+                  root.minimumStableAge >= 0, Date().timeIntervalSince(finding.modificationDate) >= root.minimumStableAge,
+                  finding.disposition == .actionable, finding.confirmationCount >= 2,
+                  finding.attemptCount == 0, !finding.hasRepairEvidence,
+                  // Durable evidence outlives finding rows; unreadable records throw and block.
+                  !AutomaticRepairCoordinator.hasOperation(for: finding, in: try env.operations.records()),
+                  await automaticAllowed() else {
+                throw MonitoringError.blocked(reason: "Auto-fix requires an enabled folder, a reviewed baseline, and a new confirmed failure while monitoring is running.")
+            }
         }
-        switch try await currentClassification(of: finding.canonicalPath) {
-        case .permanentFailure:
-            break
-        case .incompatible:
-            return try await stop(finding, reason: RequeueExplanation.message(.incompatibleProviderOutput), repository: repository)
-        default:
-            return try await stop(
-                finding,
-                reason: "Synology no longer reports a permanent upload failure for this file. No copy was made.",
-                repository: repository
-            )
+        let initial = finding
+        let persist: @Sendable (RequeueJournal) async throws -> Void = { incoming in
+            let record = enriched(incoming, fallback: initial)
+            try env.operations.save(record)
+            if let snapshot = record.finding {
+                try await repository.upsert(snapshot)
+                await env.onProgress(snapshot)
+            }
         }
-        let writeProbe = probeOpenForWriting(sourceURL.path)
-        if case .unknown(let reason) = writeProbe {
-            return try await stop(finding, reason: reason, repository: repository)
+        if let completed = try env.operations.records().first(where: { $0.finding?.id == finding.id && $0.phase == .succeeded }) {
+            return try await verifyFinalPlacement(completed, fallback: finding, repository: repository, environment: env)
         }
-        let stagingRoot = try supportDirectory("Staging")
-        try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
-        let targetDirectory = sourceURL.deletingLastPathComponent()
-        let sameVolume = try volumeToken(sourceURL) == volumeToken(stagingRoot)
-        let cloneValidated = sameVolume && probeClone(in: stagingRoot)
-        let available = try sourceURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            .volumeAvailableCapacityForImportantUsage ?? 0
-        let context = RequeueContext(
-            mode: .manual,
-            operationID: UUID(),
-            source: recorded,
-            observedSource: sameVersion ? recorded : live,
-            confirmed: true,
-            isLocal: true,
-            openForWriting: writeProbe == .open,
-            retryAlreadyActive: false,
-            attemptCount: finding.attemptCount,
-            availableBytes: available,
-            sameVolume: sameVolume,
-            cloneValidated: cloneValidated,
-            monitoringPaused: false,
-            providerAvailable: true,
-            providerCompatible: true,
-            disposition: previousDisposition == .observing && finding.errorCode == -2005
-                ? .existingNeedsReview
-                : previousDisposition,
-            baselineCompleted: false,
-            automaticEnabled: false,
+        if let record = try env.operations.pending(path: finding.canonicalPath) {
+            // A different row/version cannot take ownership of an existing operation.
+            guard record.finding?.id == finding.id,
+                  [.published, .verifying, .uploadAcknowledged].contains(record.phase) else {
+                return try await recovery(finding, message: "An interrupted repair already owns this path. Review its retained files.", repository: repository)
+            }
+            let report = await RequeueExecutor.verify(record: record, effects: env.effects,
+                evaluate: { try await evaluatedOutput($0, runner: env.runner) },
+                maxPolls: env.maxPolls, pollInterval: env.pollInterval, persist: persist)
+            return try await finish(finding, report: report, repository: repository, environment: env)
+        }
+        let known = try await repository.findings(at: finding.canonicalPath)
+        guard !finding.hasRepairEvidence,
+              !known.contains(where: { $0.canonicalPath == finding.canonicalPath && $0.id != id && $0.hasRepairEvidence && ![.requeueSucceeded, .resolved, .ignored].contains($0.disposition) }) else {
+            return try await recovery(finding, message: "This retry was created without complete repair evidence. Review the existing files; no new copy was made.", repository: repository)
+        }
+        guard ManualRepairEligibility.canStart(finding) else {
+            throw MonitoringError.blocked(reason: "This source version is not ready for a new repair.")
+        }
+        let live = try FileIntegrity.sourceVersion(sourceURL)
+        guard finding.inode == live.inode, finding.fileSize == live.fileSize,
+              abs(finding.modificationDate.timeIntervalSince(live.modificationTime)) < 1 else {
+            return try await recovery(finding, message: "The original changed after confirmation. No copy was made.", repository: repository)
+        }
+        let output = try await evaluatedOutput(finding.canonicalPath, runner: env.runner)
+        guard case .item(let item) = FileProviderParser.parse(output), FileProviderParser.isActionablePermanentFailure(item) else {
+            throw MonitoringError.blocked(reason: "A local, downloaded file with a current permanent upload failure is required.")
+        }
+        guard let open = await env.writeProbe(sourceURL.path) else {
+            throw MonitoringError.blocked(reason: "Could not safely determine whether the file is open for writing.")
+        }
+        try FileManager.default.createDirectory(at: env.stagingRoot, withIntermediateDirectories: true)
+        let target = sourceURL.deletingLastPathComponent()
+        let sameVolume = try volumeToken(sourceURL) == volumeToken(env.stagingRoot)
+        let context = RequeueContext(mode: mode, operationID: UUID(), source: live,
+            observedSource: try FileIntegrity.sourceVersion(sourceURL), confirmed: true, isLocal: item.isDownloaded == true,
+            openForWriting: open, retryAlreadyActive: false, attemptCount: finding.attemptCount,
+            availableBytes: try env.availableBytes(sourceURL), sameVolume: sameVolume,
+            cloneValidated: sameVolume && probeClone(in: env.stagingRoot), monitoringPaused: false,
+            providerAvailable: true, providerCompatible: true,
+            disposition: finding.disposition == .observing ? .existingNeedsReview : finding.disposition,
+            baselineCompleted: automaticRoot?.baselineCompletedAt != nil, automaticEnabled: automaticRoot?.automaticRequeueEnabled == true,
             stem: sourceURL.deletingPathExtension().lastPathComponent,
-            fileExtension: sourceURL.pathExtension,
-            now: Date(),
-            takenNames: siblingNames(in: targetDirectory)
-        )
+            fileExtension: sourceURL.pathExtension, now: Date(), takenNames: siblingNames(in: target))
         let decision = RequeuePlanner.decide(context)
         guard case .publish(let plan) = decision else {
-            if case .blocked(let reason) = decision {
-                finding.eligibilityBlockReason = RequeueExplanation.message(reason)
-                finding.providerState = "Requeue stopped before copying"
-                finding.lastCheckedAt = Date()
-                try await repository.upsert(finding)
-                try await repository.append(ActivityEvent(
-                    id: UUID(), timestamp: Date(), kind: .requeueBlocked, findingID: finding.id,
-                    summary: "\(finding.filename): requeue stopped before copying.",
-                    details: finding.eligibilityBlockReason
-                ))
-            }
+            if case .blocked(let reason) = decision { finding.eligibilityBlockReason = RequeueExplanation.message(reason) }
+            try await repository.upsert(finding)
             return finding
         }
-        let runner = ProcessCommandRunner()
-        let publishedSnapshot = finding
-        let report = await RequeueExecutor.publish(
-            decision: decision,
-            plan: plan,
-            sourceURL: sourceURL,
-            stagingRoot: stagingRoot,
-            targetDirectory: targetDirectory,
-            openForWriting: context.openForWriting,
-            effects: .system(),
-            evaluate: { path in
-                try await evaluatedOutput(path, runner: runner)
+        let report = await RequeueExecutor.publish(decision: decision, plan: plan, sourceURL: sourceURL,
+            stagingRoot: env.stagingRoot, targetDirectory: target, openForWriting: open, effects: env.effects,
+            evaluate: { try await evaluatedOutput($0, runner: env.runner) },
+            authorizePublication: {
+                guard await env.writeProbe(sourceURL.path) == false else {
+                    throw MonitoringError.blocked(reason: "The file is open for writing or the writer check could not be completed.")
+                }
+                if mode == .automatic {
+                    guard await automaticAllowed(),
+                          try await repository.roots().contains(where: { $0.id == initial.rootIdentifier && $0.enabled && $0.automaticRequeueEnabled }) else {
+                        throw MonitoringError.blocked(reason: "Auto-fix was turned off or monitoring paused before publication.")
+                    }
+                }
             },
-            maxPolls: 240,
-            pollInterval: .seconds(15),
-            onPublished: { path in
-                var current = publishedSnapshot
-                current.retryPath = path
-                current.disposition = .requeueUploading
-                current.providerState = "Waiting for Synology to report the retry uploaded"
-                current.eligibilityBlockReason = "The complete retry copy is in the folder. The original file was not changed."
-                try? await repository.upsert(current)
+            authorizeFullCopy: {
+                let assessment = DiskSpacePolicy().assess(available: try env.availableBytes(sourceURL),
+                    sourceSize: live.fileSize, sameVolume: sameVolume, cloneValidated: false)
+                if case .allowed = assessment { return true }
+                throw MonitoringError.blocked(reason: "The clone failed and a full copy does not have sufficient free space.")
+            },
+            maxPolls: env.maxPolls, pollInterval: env.pollInterval, persist: persist)
+        return try await finish(finding, report: report, repository: repository, environment: env)
+    }
+
+    private static func enriched(_ journal: RequeueJournal, fallback: FindingSnapshot) -> RequeueJournal {
+        var result = journal
+        result.updatedAt = Date()
+        result.finding = FindingRequeue.snapshot(for: result, fallback: fallback)
+        return result
+    }
+
+    private static func finish(_ initial: FindingSnapshot, report: ExecutionReport,
+                               repository: FindingRepository, environment env: Environment) async throws -> FindingSnapshot {
+        var finding = initial
+        FindingRequeue.apply(report, to: &finding, previousDisposition: initial.disposition, now: Date())
+        if case .uploaded = report.outcome, let last = report.journals.last {
+            var record = enriched(last, fallback: initial)
+            record.finalPathVerificationRequired = true
+            guard await env.writeProbe(initial.canonicalPath) == false else {
+                record.message = "Final placement waits until the original is closed for writing and the writer check succeeds."
+                record = enriched(record, fallback: initial)
+                try env.operations.save(record)
+                let deferred = record.finding ?? finding
+                try await repository.upsert(deferred)
+                await env.onProgress(deferred)
+                return deferred
             }
-        )
-        return try await finish(
-            finding,
-            report: report,
-            previousDisposition: previousDisposition,
-            live: live,
-            sourceURL: sourceURL,
-            repository: repository
-        )
-    }
-
-    /// A later Fix of a file that already has a published sibling only checks that sibling.
-    private static func resumeVerification(
-        finding: FindingSnapshot,
-        retryPath: String,
-        live: SourceVersionKey,
-        repository: FindingRepository
-    ) async throws -> FindingSnapshot {
-        guard FileManager.default.fileExists(atPath: retryPath) else {
-            return try await stop(
-                finding,
-                reason: "The published retry is no longer at the recorded path. No new copy was made.",
-                repository: repository,
-                disposition: .requeueFailed
-            )
-        }
-        let runner = ProcessCommandRunner()
-        var outcome: ExecutionOutcome = .verifying
-        var identifier: String?
-        for attempt in 0..<240 {
-            if attempt > 0 { try await Task.sleep(for: .seconds(15)) }
-            let output = try await evaluatedOutput(retryPath, runner: runner)
-            switch EvaluationClassification.classify(FileProviderParser.parse(output)) {
-            case .uploaded:
-                if case .item(let item) = FileProviderParser.parse(output) { identifier = item.itemIdentifier }
-                outcome = .uploaded(itemIdentifier: identifier)
-            case .permanentFailure(_, let code):
-                outcome = .retryFailed(code: code)
-            case .incompatible:
-                outcome = .blocked(.incompatibleProviderOutput)
-            case .excluded, .syncPaused, .uploading, .notUploaded, .missingItem:
-                continue
+            let normalization = RetryFinalizer.system().finish(record: record, undoRoot: env.undoRoot) { journal in
+                try env.operations.save(enriched(journal, fallback: initial))
             }
-            if case .verifying = outcome { continue }
-            break
-        }
-        let report = ExecutionReport(
-            outcome: outcome,
-            journals: [RequeueJournal(
-                id: UUID(),
-                phase: outcome == .verifying ? .verifying : .succeeded,
-                source: live,
-                stagedPath: nil,
-                publishedPath: retryPath,
-                updatedAt: Date()
-            )]
-        )
-        return try await finish(finding, report: report, previousDisposition: finding.disposition, live: live, sourceURL: URL(fileURLWithPath: finding.canonicalPath), repository: repository)
-    }
-
-    private static func currentClassification(of path: String) async throws -> EvaluationClassification {
-        let output = try await evaluatedOutput(path, runner: ProcessCommandRunner())
-        return EvaluationClassification.classify(FileProviderParser.parse(output))
-    }
-
-    private static func evaluatedOutput(_ path: String, runner: ProcessCommandRunner) async throws -> String {
-        let result = try await runner.run(
-            executable: URL(fileURLWithPath: "/usr/bin/fileproviderctl"),
-            arguments: ["evaluate", path]
-        )
-        guard result.exitCode == 0 else {
-            throw MonitoringError.blocked(reason: "Provider evaluation failed (exit \(result.exitCode)).")
-        }
-        return result.standardOutput
-    }
-
-    private static func stop(
-        _ finding: FindingSnapshot,
-        reason: String,
-        repository: FindingRepository,
-        disposition: FindingDisposition? = nil
-    ) async throws -> FindingSnapshot {
-        var finding = finding
-        if let disposition { finding.disposition = disposition }
-        finding.eligibilityBlockReason = reason
-        finding.providerState = "Requeue stopped before copying"
-        finding.lastCheckedAt = Date()
-        try await repository.upsert(finding)
-        try await repository.append(ActivityEvent(
-            id: UUID(), timestamp: Date(), kind: .requeueBlocked, findingID: finding.id,
-            summary: "\(finding.filename): requeue stopped before copying.",
-            details: reason
-        ))
-        return finding
-    }
-
-    private static func finish(
-        _ finding: FindingSnapshot,
-        report: ExecutionReport,
-        previousDisposition: FindingDisposition,
-        live: SourceVersionKey,
-        sourceURL: URL,
-        repository: FindingRepository
-    ) async throws -> FindingSnapshot {
-        var finding = finding
-        let finished = Date()
-        FindingRequeue.apply(report, to: &finding, previousDisposition: previousDisposition, now: finished)
-        if case .uploaded = report.outcome, let retryPath = finding.retryPath {
-            let undoRoot = try UndoArchive.supportRoot()
-            var finalizer = RetryFinalizer.system()
-            let findingID = finding.id
-            finalizer.remove = { url in
-                _ = try UndoArchive.store(file: url, findingID: findingID, root: undoRoot)
-            }
-            let normalization = finalizer.finish(
-                original: sourceURL,
-                retry: URL(fileURLWithPath: retryPath),
-                expectedInode: live.inode,
-                expectedSize: live.fileSize,
-                expectedModified: live.modificationTime
-            )
             switch normalization {
-            case .replaced(let finalURL):
-                finding.canonicalPath = finalURL.path
-                finding.filename = finalURL.lastPathComponent
-                finding.retryPath = finalURL.path
-                finding.providerState = "Synology reports the replacement uploaded"
-                finding.eligibilityBlockReason = "The uploaded copy uses the original name. Undo can restore the previous file for 6 hours."
-            case .leftInPlace(let reason):
-                finding.eligibilityBlockReason = reason
-            case .originalRemoved(let retryURL, let reason):
-                finding.retryPath = retryURL.path
-                finding.providerState = "Uploaded copy kept under the retry name"
-                finding.eligibilityBlockReason = reason
+            case .replaced, .replacedWithWarning:
+                guard let completed = try env.operations.records().first(where: { $0.id == record.id }), completed.phase == .succeeded else {
+                    throw MonitoringError.blocked(reason: "Final placement could not be committed. Review Recovery.")
+                }
+                finding = try await verifyFinalPlacement(completed, fallback: initial, repository: repository, environment: env)
+                if case .replacedWithWarning(_, let warning) = normalization { finding.eligibilityBlockReason = warning }
+            case .leftInPlace(let reason), .originalRemoved(_, let reason):
+                var recovery = try env.operations.records().first(where: { $0.id == record.id }) ?? record
+                recovery.phase = .recoveryRequired; recovery.message = reason
+                recovery = enriched(recovery, fallback: initial)
+                try env.operations.save(recovery)
+                finding = recovery.finding ?? finding
             }
         }
         try await repository.upsert(finding)
-        try await repository.append(ActivityEvent(
-            id: UUID(), timestamp: finished, kind: activityKind(report.outcome), findingID: finding.id,
-            summary: "\(finding.filename): \(finding.providerState)",
-            details: finding.eligibilityBlockReason,
-            result: finding.disposition.rawValue
-        ))
+        // Background verification runs every few minutes; record outcomes, not each unchanged check.
+        if finding.disposition != initial.disposition || finding.providerState != initial.providerState {
+            try await repository.append(ActivityEvent(id: UUID(), timestamp: Date(),
+                kind: finding.disposition == .requeueSucceeded ? .requeueSucceeded : .recovery,
+                findingID: finding.id, summary: "\(finding.filename): \(finding.providerState)",
+                details: finding.eligibilityBlockReason, result: finding.disposition.rawValue))
+        }
         return finding
     }
 
-    private static func liveIdentity(_ url: URL) throws -> SourceVersionKey {
-        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard values.isRegularFile == true,
-              let size = values.fileSize,
-              let modified = values.contentModificationDate,
-              let inode = attributes[.systemFileNumber] as? NSNumber else {
-            throw MonitoringError.blocked(reason: "The original file is not a local regular file.")
+    private static func verifyFinalPlacement(_ record: RequeueJournal, fallback: FindingSnapshot,
+                                              repository: FindingRepository, environment env: Environment) async throws -> FindingSnapshot {
+        var record = record
+        if record.finalPathVerifiedAt == nil {
+            do {
+                let path = URL(fileURLWithPath: record.source.canonicalPath)
+                let before = try FileIntegrity.identity(path)
+                let output = try await evaluatedOutput(path.path, runner: env.runner)
+                let parsed = FileProviderParser.parse(output)
+                let classification = EvaluationClassification.classify(parsed)
+                if case .permanentFailure(let domain, let code) = classification {
+                    // The replacement is in place but stuck under its final name. No further copy is made;
+                    // the original stays archived for Undo, and later checks may still see it upload.
+                    record.finalPathError = "\(domain) \(code)"
+                    throw FinalNameFailure()
+                }
+                // Only a healthy upload state clears the failure; a missing or paused item says nothing new.
+                if [.uploaded, .uploading, .notUploaded].contains(classification) { record.finalPathError = nil }
+                guard case .item(let item) = parsed,
+                      classification == .uploaded,
+                      item.documentSize == nil || item.documentSize == before.fileSize,
+                      let digest = record.retrySHA256,
+                      try await env.effects.hashFile(path) == digest,
+                      try FileIntegrity.identity(path).sameContentMetadata(as: before) else {
+                    throw MonitoringError.blocked(reason: "The final filename has not acknowledged the verified replacement uploaded.")
+                }
+                record.finalPathVerifiedAt = Date()
+                record.finalPathError = nil
+                record.message = nil
+                record.updatedAt = Date()
+                record = enriched(record, fallback: fallback)
+                try env.operations.save(record)
+            } catch {
+                if let failure = record.finalPathError {
+                    record.message = "Synology reports the final filename failed to upload (\(failure)). No further copy was made; the original is kept for Undo."
+                        + (error is FinalNameFailure ? "" : " The latest check did not finish: \(error.localizedDescription)")
+                } else {
+                    record.message = "Local placement completed. Final-name verification is pending: \(error.localizedDescription)"
+                }
+                record.updatedAt = Date()
+                record = enriched(record, fallback: fallback)
+                try env.operations.save(record)
+            }
         }
-        return SourceVersionKey(
-            canonicalPath: url.resolvingSymlinksInPath().path,
-            inode: inode.uint64Value,
-            fileSize: Int64(size),
-            modificationTime: modified
-        )
+        if record.finalPathVerifiedAt != nil, let archive = record.archiveID,
+           UndoArchive.records(in: env.undoRoot).first(where: { $0.id == archive })?.purgeAllowed != true {
+            do { try UndoArchive.armExpiry(id: archive, root: env.undoRoot) }
+            catch {
+                record.message = "Final filename reports uploaded. The retention update could not be confirmed; review the archive in Recovery."
+                record = enriched(record, fallback: fallback)
+                try env.operations.save(record)
+            }
+        }
+        let result = FindingRequeue.snapshot(for: record, fallback: fallback)
+        try await repository.upsert(result)
+        await env.onProgress(result)
+        return result
     }
 
-    private static func supportDirectory(_ name: String) throws -> URL {
-        try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent(AppStorage.folderName, isDirectory: true)
-            .appendingPathComponent(name, isDirectory: true)
+    private static func recovery(_ initial: FindingSnapshot, message: String, repository: FindingRepository) async throws -> FindingSnapshot {
+        var finding = initial
+        finding.disposition = .recoveryRequired
+        finding.providerState = "Recovery review required"
+        finding.eligibilityBlockReason = message
+        try await repository.upsert(finding)
+        return finding
+    }
+
+    private static func evaluatedOutput(_ path: String, runner: any CommandRunning) async throws -> String {
+        let result = try await runner.run(executable: URL(fileURLWithPath: "/usr/bin/fileproviderctl"), arguments: ["evaluate", path])
+        guard result.exitCode == 0 else { throw MonitoringError.blocked(reason: "Provider evaluation failed (exit \(result.exitCode)).") }
+        return result.standardOutput
     }
 
     private static func volumeToken(_ url: URL) throws -> String {
@@ -308,41 +297,7 @@ enum ManualRequeueAction {
         return Set(names)
     }
 
-    private enum WriteProbe: Equatable {
-        case closed
-        case open
-        case unknown(String)
-    }
-
-    /// Reads lsof output before waiting, so a full pipe cannot deadlock the probe.
-    /// An unreadable result blocks Fix. It is not treated as "nothing has the file open."
-    private static func probeOpenForWriting(_ path: String) -> WriteProbe {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-F", "a", "--", path]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = Pipe()
-        do { try process.run() }
-        catch { return .unknown("Could not check whether the file is open for writing.") }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard let text = String(data: data, encoding: .utf8) else {
-            return .unknown("Could not read the open-file check.")
-        }
-        if process.terminationStatus != 0 && text.isEmpty { return .closed }
-        for line in text.split(separator: "\n") where line.hasPrefix("a") {
-            let mode = line.dropFirst()
-            if mode.contains("w") || mode.contains("u") { return .open }
-        }
-        return .closed
-    }
-
-    private static func activityKind(_ outcome: ExecutionOutcome) -> ActivityKind {
-        switch outcome {
-        case .uploaded: .requeueSucceeded
-        case .retryFailed, .blocked: .requeueFailed
-        case .verifying: .requeueStarted
-        }
-    }
 }
+
+/// Thrown when the final filename reports the permanent failure; its message is built from the record.
+private struct FinalNameFailure: Error {}
