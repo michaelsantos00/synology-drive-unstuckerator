@@ -62,7 +62,7 @@ public struct MonitorSettingsView: View {
                 LaunchAtLoginToggle(model: model)
             }
             Section("Notifications") {
-                Toggle(isOn: Binding(get: { model.desktopNotificationsEnabled }, set: model.setNotificationsEnabled)) {
+                Toggle(isOn: Binding(get: { model.desktopNotificationsEnabled }, set: { model.setNotificationsEnabled($0) })) {
                     Text("Notify me about files")
                     Text("When a file needs a decision, or a repair finishes or stops.")
                 }
@@ -78,7 +78,7 @@ public struct MonitorSettingsView: View {
                 }
             }
             Section("Monitoring") {
-                Toggle(isOn: Binding(get: { model.monitoringEnabled }, set: model.setMonitoringEnabled)) {
+                Toggle(isOn: Binding(get: { model.monitoringEnabled }, set: { model.setMonitoringEnabled($0) })) {
                     Text("Monitor watched folders")
                     Text("Pausing stops scans and new repairs. Copies already published keep verifying.")
                 }
@@ -146,7 +146,7 @@ public struct MonitorSettingsView: View {
                     } description: {
                         Text("Add a Synology Drive folder, or drag one here.")
                     } actions: {
-                        Button("Add Folder…", action: requestAdd).disabled(busy)
+                        Button("Add Folder…") { requestAdd() }.disabled(busy)
                     }
                 }
             }
@@ -158,7 +158,7 @@ public struct MonitorSettingsView: View {
 
     private var folderList: some View {
         VStack(spacing: 0) {
-            List(selection: Binding(get: { model.editingRootID }, set: requestSelection)) {
+            List(selection: Binding(get: { model.editingRootID }, set: { requestSelection($0) })) {
                 ForEach(model.watchedRoots) { root in
                     HStack(spacing: 8) {
                         Image(systemName: root.enabled ? "folder.fill" : "folder")
@@ -177,7 +177,7 @@ public struct MonitorSettingsView: View {
             .listStyle(.sidebar)
             Divider()
             HStack(spacing: 0) {
-                Button(action: requestAdd) { Label("Add Folder…", systemImage: "plus").frame(width: 26, height: 22) }
+                Button { requestAdd() } label: { Label("Add Folder…", systemImage: "plus").frame(width: 26, height: 22) }
                     .help("Add a folder to watch")
                 Divider().frame(height: 14)
                 Button { confirmRemoval = true } label: { Label("Remove Folder…", systemImage: "minus").frame(width: 26, height: 22) }
@@ -249,7 +249,7 @@ public struct MonitorSettingsView: View {
                             Text(preset.detail)
                         }
                     }
-                    TextField("Other extensions", text: Binding(get: { model.customExtensionsText }, set: model.setCustomExtensions),
+                    TextField("Other extensions", text: Binding(get: { model.customExtensionsText }, set: { model.setCustomExtensions($0) }),
                               prompt: Text("psd, ai, iso"))
                 }
                 Section("Rules") {
