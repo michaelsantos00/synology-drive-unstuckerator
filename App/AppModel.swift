@@ -1147,7 +1147,7 @@ public final class AppModel {
         Retry eligibility: \(canRequeue(finding) ? "Fix can publish one verified copy" : "Fix is not available for this row")
         Block reason: \(diagnosticText(finding.eligibilityBlockReason ?? "None"))
         Attempts: \(finding.attemptCount)
-        Retry: \(finding.retryPath.map(pathText) ?? "None")
+        Retry: \(finding.retryPath.map { pathText($0) } ?? "None")
         Retry item: \(showRawPaths ? finding.retryItemIdentifier ?? "None" : "Hidden")
         Upload verified: \(finding.uploadVerifiedAt?.ISO8601Format() ?? "Not verified")
         Source SHA-256: \(finding.sourceSHA256 ?? "Not calculated")

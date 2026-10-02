@@ -135,8 +135,8 @@ public struct ActivityView: View {
 
     private var visibleFindings: [FindingSnapshot] {
         // Queues keep the model's order (most urgent first); history lists show the newest first.
-        let base = filter.queue.map(model.queueFindings)
-            ?? model.findings.filter(filter.includes).sorted { $0.lastCheckedAt > $1.lastCheckedAt }
+        let base = filter.queue.map { model.queueFindings($0) }
+            ?? model.findings.filter { filter.includes($0) }.sorted { $0.lastCheckedAt > $1.lastCheckedAt }
         return base.filter { matches($0.filename, $0.canonicalPath) }
     }
 
@@ -420,7 +420,7 @@ struct RecoveryList: View {
             if !files.isEmpty {
                 Section {
                     ForEach(files) { file in
-                        RecoveryFileRow(model: model, file: file, export: export).findingTag(file.record.findingID, in: model)
+                        RecoveryFileRow(model: model, file: file, export: { export($0) }).findingTag(file.record.findingID, in: model)
                     }
                 } header: {
                     Text("Retained Originals")
