@@ -11,6 +11,8 @@ public struct WatchedRootSnapshot: Equatable, Sendable, Codable, Identifiable {
     public var automaticRequeueEnabled: Bool
     public var baselineCompletedAt: Date?
 
+    public var checksAllFileTypes: Bool { extensions.contains(FileFormatCatalog.allFilesMarker) }
+
     public init(
         id: UUID,
         path: String,

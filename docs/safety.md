@@ -51,7 +51,9 @@ These rules are part of the product. They are not suggestions.
 
 ## Scope of a watched root
 
-The path the user confirms is the top of the tree. Scans walk nested folders. New discovery evaluates eligible extensions modified inside the age window. Already known unresolved files keep receiving follow-up outside that window. Files younger than the minimum stable age are listed and scheduled for a later check. They are not dropped with no trace.
+The path the user confirms is the top of the tree. Scans walk nested folders. Each folder can select extensions or opt into All file types, including extensionless files. Both discovery and event-driven checks use the same type rules. All file types retains exclusions for hidden, empty, temporary, lock, conflict, and retry files; discovery skips package descendants. The type choice is stored as a reserved `*` entry alongside the selected extensions, preserving existing folder records and selections without a store migration. It does not change automatic-repair permission or bypass stability and confirmation checks.
+
+New discovery evaluates eligible files modified inside the seven-day window, including with All file types enabled. Already known unresolved files keep receiving follow-up outside that window. Files younger than the minimum stable age are listed and scheduled for a later check. They are not dropped with no trace.
 
 ## Controls and resource limits
 

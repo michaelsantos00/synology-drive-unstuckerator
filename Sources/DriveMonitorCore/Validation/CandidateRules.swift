@@ -69,9 +69,8 @@ public enum CandidateRules {
         }
 
         let lowered = name.lowercased()
-        let allowed = Set(extensions.map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) })
         let ext = (name as NSString).pathExtension.lowercased()
-        if ext.isEmpty || !allowed.contains(ext) {
+        if !FileFormatCatalog.allows(fileExtension: ext, extensions: extensions) {
             return .reject(reason: "extension is not eligible")
         }
 
@@ -81,8 +80,9 @@ public enum CandidateRules {
                 return .reject(reason: "name matches an ignore pattern")
             }
         }
-        let blockedSuffixes = [".tmp", ".temp", ".partial", ".part", ".download", ".crdownload"]
-        if blockedSuffixes.contains(where: { lowered.hasSuffix($0) }) {
+        let blockedSuffixes = [".tmp", ".temp", ".partial", ".part", ".download", ".crdownload",
+                               ".lock", ".lck", ".idlk", ".swp", ".swo", "~lock~", "~"]
+        if lowered.hasPrefix("~$") || blockedSuffixes.contains(where: { lowered.hasSuffix($0) }) {
             return .reject(reason: "temporary filename")
         }
         return .accept

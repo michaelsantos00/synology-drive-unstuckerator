@@ -3,6 +3,20 @@ import Testing
 @testable import DriveMonitorCore
 
 @Suite struct FindingRepositoryTests {
+    @Test func allTypesAndSelectedTypesRoundTripThroughDiskStore() async throws {
+        let directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = WatchedRootSnapshot(id: UUID(), path: "/fixture/design", displayName: "Design", enabled: true,
+            extensions: ["*", "mp4", "psb"], ignorePatterns: ["*.skip"], minimumStableAge: 300, automaticRequeueEnabled: false)
+        do {
+            let repository = try FindingRepository(inMemory: false, storageDirectory: directory)
+            try await repository.save(root: root)
+        }
+        let reopened = try FindingRepository(inMemory: false, storageDirectory: directory)
+        #expect(try await reopened.roots() == [root])
+        #expect(try await reopened.roots().first?.checksAllFileTypes == true)
+    }
+
     @Test func testRepositoryRoundTrip() async throws {
         let repository = try FindingRepository(inMemory: true)
         let date = Date(timeIntervalSince1970: 1_800_000_000)

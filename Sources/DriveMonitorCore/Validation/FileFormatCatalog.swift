@@ -15,6 +15,14 @@ public struct FileFormatPreset: Identifiable, Hashable, Sendable {
 }
 
 public enum FileFormatCatalog {
+    /// Stored alongside selected extensions so existing folder records need no schema migration.
+    public static let allFilesMarker = "*"
+
+    public static func allows(fileExtension: String, extensions: [String]) -> Bool {
+        let allowed = Set(extensions.map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) })
+        return allowed.contains(allFilesMarker) || (!fileExtension.isEmpty && allowed.contains(fileExtension.lowercased()))
+    }
+
     public static let presets: [FileFormatPreset] = [
         FileFormatPreset(id: "video", title: "Video", detail: "mp4, mov, m4v, mkv", extensions: ["mp4", "mov", "m4v", "mkv"]),
         FileFormatPreset(id: "archives", title: "Archives", detail: "zip, 7z, rar, tar, gz", extensions: ["zip", "7z", "rar", "tar", "gz"]),
@@ -23,14 +31,14 @@ public enum FileFormatCatalog {
         FileFormatPreset(id: "audio", title: "Large audio", detail: "wav, aiff, flac", extensions: ["wav", "aiff", "flac"])
     ]
 
-    public static func extensions(enabledPresetIDs: Set<String>, customText: String) -> [String] {
+    public static func extensions(enabledPresetIDs: Set<String>, customText: String, allFileTypes: Bool = false) -> [String] {
         let presetExtensions = presets
             .filter { enabledPresetIDs.contains($0.id) }
             .flatMap(\.extensions)
         let custom = customText
             .split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" })
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() }
-            .filter { !$0.isEmpty }
-        return Array(Set(presetExtensions + custom)).sorted()
+            .filter { !$0.isEmpty && $0 != allFilesMarker }
+        return Array(Set(presetExtensions + custom + (allFileTypes ? [allFilesMarker] : []))).sorted()
     }
 }

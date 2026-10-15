@@ -3,6 +3,49 @@ import Testing
 @testable import DriveMonitorCore
 
 @Suite struct MonitoringEngineTests {
+    @Test func allTypesDiscoveryAndEventsUseProductionNameRules() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let fixture = try EngineFixture(directory: directory, extensions: ["*"], useProductionCandidate: true)
+        let stable = fixture.clock.date().addingTimeInterval(-400)
+        let expected = try ["Signs.PSB", "layout.af", "README", "episode.mp4"].map {
+            try directory.file($0, modified: stable).path
+        }
+        for name in [".hidden", "export.tmp", "layout.af~lock~", "layout.idlk", "~$notes.docx",
+                     "Signs.__requeued-123.psb", "clip_segment_1.psb", "private.skip"] {
+            _ = try directory.file(name, modified: stable)
+        }
+        _ = try directory.file("old.psb", modified: stable.addingTimeInterval(-8 * 86400))
+        let empty = try directory.file("empty.psb", modified: stable)
+        try Data().write(to: empty)
+        try FileManager.default.setAttributes([.modificationDate: stable], ofItemAtPath: empty.path)
+        try FileManager.default.createSymbolicLink(at: directory.url.appendingPathComponent("alias.psb"),
+                                                  withDestinationURL: URL(fileURLWithPath: expected[0]))
+        var root = fixture.root; root.ignorePatterns = ["*.skip"]
+        try await fixture.engine.start(roots: [root])
+        try await fixture.engine.scanNow()
+        #expect(Set(await fixture.runner.paths) == Set(expected))
+        let eventFile = try directory.file("event-without-extension", modified: stable)
+        fixture.watcher.push(eventFile.path)
+        for _ in 0..<100 {
+            if await fixture.runner.paths.contains(eventFile.path) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(await fixture.runner.paths.contains(eventFile.path))
+        await fixture.engine.stop()
+    }
+
+    @Test func selectedTypesStillExcludeUnselectedFilesWithProductionRules() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let fixture = try EngineFixture(directory: directory, useProductionCandidate: true)
+        try await fixture.start()
+        for name in ["Signs.psb", "README"] {
+            _ = try await fixture.engine.evaluateFile(try directory.file(name))
+        }
+        #expect(await fixture.runner.paths.isEmpty)
+        #expect(try await fixture.repository.findings(matching: nil).isEmpty)
+        await fixture.engine.stop()
+    }
+
     @Test func storeChangeCallbackCanAcquireTheEvaluatedPath() async throws {
         let directory = try TestDirectory(); defer { directory.remove() }
         let file = try directory.file("episode.mp4")
@@ -471,7 +514,7 @@ private struct EngineFixture {
     let root: WatchedRootSnapshot
     let engine: MonitoringEngine
 
-    init(directory: TestDirectory, permanentFailure: Bool = false, downloaded: Bool = true, failure: FixtureRunner.Failure? = nil, minimumStableAge: TimeInterval = 0, access: RepairAccess = RepairAccess(), forcedClassification: EvaluationClassification? = nil, store makeStore: ((FindingRepository) -> any FindingStoring)? = nil) throws {
+    init(directory: TestDirectory, permanentFailure: Bool = false, downloaded: Bool = true, failure: FixtureRunner.Failure? = nil, minimumStableAge: TimeInterval = 0, access: RepairAccess = RepairAccess(), forcedClassification: EvaluationClassification? = nil, extensions: [String] = ["mp4"], useProductionCandidate: Bool = false, store makeStore: ((FindingRepository) -> any FindingStoring)? = nil) throws {
         let repository = try FindingRepository(inMemory: true)
         let runner = FixtureRunner(failure: failure)
         let watcher = MemoryWatcher()
@@ -481,7 +524,7 @@ private struct EngineFixture {
         self.watcher = watcher
         self.clock = clock
         root = WatchedRootSnapshot(id: UUID(), path: directory.url.path, displayName: "Fixture", enabled: true,
-            extensions: ["mp4"], ignorePatterns: [], minimumStableAge: minimumStableAge, automaticRequeueEnabled: false)
+            extensions: extensions, ignorePatterns: [], minimumStableAge: minimumStableAge, automaticRequeueEnabled: false)
         let interpreting = EvaluationInterpreting(
             parse: { output in
                 guard output == FixtureRunner.uploaded else { return .incompatible(reason: "Unknown fixture output.") }
@@ -499,7 +542,8 @@ private struct EngineFixture {
             },
             isActionablePermanentFailure: { $0.isDownloaded == true && $0.isUploaded == false && $0.uploadingErrorCode == -2005 },
             candidate: { path, _ in
-                path.hasSuffix(".mp4") && !path.contains("_segment_") ? .accept : .reject(reason: "Not an eligible media candidate.")
+                if useProductionCandidate { return ProductionInterpretation.standard.candidate(path, minimumStableAge) }
+                return path.hasSuffix(".mp4") && !path.contains("_segment_") ? .accept : .reject(reason: "Not an eligible media candidate.")
             },
             confirm: { previous, _, _, baselineComplete in
                 let count = (previous?.confirmationCount ?? 0) + 1

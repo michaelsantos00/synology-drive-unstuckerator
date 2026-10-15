@@ -8,14 +8,14 @@ public enum ProductionInterpretation {
         candidate: { path, _ in
             let url = URL(fileURLWithPath: path)
             let name = url.lastPathComponent
-            let ext = url.pathExtension.isEmpty ? "mp4" : url.pathExtension
             return CandidateRules.evaluate(
                 name: name,
                 isHidden: name.hasPrefix("."),
                 isRegularFile: true,
                 byteSize: 1,
                 age: CandidateRules.defaultMinimumAge,
-                extensions: [ext]
+                // The engine applies each folder's type selection separately; this policy checks names.
+                extensions: [FileFormatCatalog.allFilesMarker]
             )
         },
         confirm: { previous, previousObservation, latest, baselineCompleted in

@@ -10,13 +10,14 @@ public enum RetryNaming {
         timeZone: TimeZone = .current
     ) -> String {
         let cleanedExtension = ext.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let extensionSuffix = cleanedExtension.isEmpty ? "" : ".\(cleanedExtension)"
         let stamp = timestamp(now, timeZone: timeZone)
-        let base = "\(stem).__requeued-\(stamp).\(cleanedExtension)"
+        let base = "\(stem).__requeued-\(stamp)\(extensionSuffix)"
         if !takenNames.contains(base) {
             return base
         }
         let suffix = sanitizedSuffix(randomSuffix) ?? fallbackSuffix()
-        return "\(stem).__requeued-\(stamp)-\(suffix).\(cleanedExtension)"
+        return "\(stem).__requeued-\(stamp)-\(suffix)\(extensionSuffix)"
     }
 
     private static func timestamp(_ date: Date, timeZone: TimeZone) -> String {
