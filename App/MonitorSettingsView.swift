@@ -242,15 +242,24 @@ public struct MonitorSettingsView: View {
                     }
                 }
                 Section("File Types") {
-                    ForEach(FileFormatCatalog.presets) { preset in
-                        Toggle(isOn: Binding(get: { model.enabledFormatPresets.contains(preset.id) },
-                            set: { model.setFormatPreset(preset.id, enabled: $0) })) {
-                            Text(preset.title)
-                            Text(preset.detail)
-                        }
+                    Toggle(isOn: $model.checkAllFileTypes) {
+                        Text("All file types")
+                        Text("Includes design files, images, documents, and files without extensions. Temporary files and repair copies stay excluded.")
                     }
-                    TextField("Other extensions", text: Binding(get: { model.customExtensionsText }, set: { model.setCustomExtensions($0) }),
-                              prompt: Text("psd, ai, iso"))
+                    Group {
+                        ForEach(FileFormatCatalog.presets) { preset in
+                            Toggle(isOn: Binding(get: { model.enabledFormatPresets.contains(preset.id) },
+                                set: { model.setFormatPreset(preset.id, enabled: $0) })) {
+                                Text(preset.title)
+                                Text(preset.detail)
+                            }
+                        }
+                        TextField("Other extensions", text: Binding(get: { model.customExtensionsText }, set: { model.setCustomExtensions($0) }),
+                                  prompt: Text("psb, psd, af, ai"))
+                    }
+                    .disabled(model.checkAllFileTypes)
+                    Text("Selected types are kept when All file types is turned off. Auto-fix, if enabled, applies to every checked type.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 Section("Rules") {
                     TextField("Ignore names matching", text: $model.ignorePatternsText)
@@ -259,7 +268,7 @@ public struct MonitorSettingsView: View {
                             Text(Self.durationText(seconds)).tag(seconds)
                         }
                     }
-                    Text("Separate patterns with commas. Temporary _segment_ files are always ignored. Files changed in the last 7 days are discovered; known failures stay tracked.")
+                    Text("Separate patterns with commas. Temporary and lock files, hidden files, and repair copies are always ignored. Discovery covers the last 7 days, including with All file types on; known failures stay tracked.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -377,7 +386,8 @@ public struct MonitorSettingsView: View {
     private func folderState(_ root: WatchedRootSnapshot) -> String {
         if !root.enabled { return "Off" }
         if model.unavailableRootIDs.contains(root.id) { return "Waiting for access" }
-        return root.automaticRequeueEnabled && model.automaticControlsAvailable ? "Watching · Auto-fix on" : "Watching"
+        let coverage = root.checksAllFileTypes ? "All file types" : "Selected file types"
+        return root.automaticRequeueEnabled && model.automaticControlsAvailable ? "\(coverage) · Auto-fix on" : coverage
     }
 }
 

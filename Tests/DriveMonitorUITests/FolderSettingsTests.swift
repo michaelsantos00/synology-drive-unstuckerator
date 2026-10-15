@@ -4,6 +4,66 @@ import DriveMonitorCore
 @testable import DriveMonitorUI
 
 @Suite @MainActor struct FolderSettingsTests {
+    @Test func allTypesAppliesOnlyToSelectedFolderAndSurvivesRelaunchAndRevert() async throws {
+        let fixture = try FolderFixture(); defer { fixture.remove() }
+        var first = fixture.root("Media"); first.extensions = ["mp4", "psb"]
+        let second = fixture.root("Other")
+        let repository = try FindingRepository(inMemory: true)
+        try await repository.replaceRoots([first, second])
+        var scans = 0
+        var cb = callbacks(repository)
+        cb.scan = { scans += 1; return try await repository.findings(matching: nil) }
+        let model = AppModel(callbacks: cb)
+        await model.restoreSavedMonitoring()
+        model.selectSettingsRoot(first.id)
+        #expect(!model.checkAllFileTypes && !model.hasPendingFolderSettings)
+        model.checkAllFileTypes = true
+        #expect(model.hasPendingFolderSettings)
+        model.selectSettingsRoot(first.id) // Revert the draft.
+        #expect(!model.checkAllFileTypes && !model.hasPendingFolderSettings)
+        model.checkAllFileTypes = true
+        let scansBeforeApplying = scans
+        model.applyRootSettings()
+        try await settle(model)
+        #expect(!model.hasPendingFolderSettings)
+        #expect(scans > scansBeforeApplying)
+        let saved = try await repository.roots()
+        #expect(saved.first { $0.id == first.id }?.checksAllFileTypes == true)
+        #expect(saved.first { $0.id == second.id } == second)
+        let reopened = AppModel(callbacks: cb)
+        await reopened.restoreSavedMonitoring()
+        reopened.selectSettingsRoot(first.id)
+        #expect(reopened.checkAllFileTypes && !reopened.hasPendingFolderSettings)
+        #expect(reopened.customExtensionsText == "mp4, psb")
+        reopened.selectSettingsRoot(second.id)
+        #expect(!reopened.checkAllFileTypes)
+        reopened.selectSettingsRoot(first.id)
+        reopened.checkAllFileTypes = false
+        reopened.applyRootSettings()
+        try await settle(reopened)
+        #expect(try await repository.roots().first { $0.id == first.id } == first)
+    }
+
+    @Test func allTypesCanBeSavedWithoutAnySelectedExtensions() async throws {
+        let fixture = try FolderFixture(); defer { fixture.remove() }
+        let root = fixture.root("Media")
+        let repository = try FindingRepository(inMemory: true)
+        try await repository.save(root: root)
+        let model = AppModel(callbacks: callbacks(repository))
+        await model.restoreSavedMonitoring()
+        model.selectSettingsRoot(root.id)
+        model.enabledFormatPresets = []
+        model.customExtensionsText = ""
+        model.checkAllFileTypes = true
+        model.applyRootSettings()
+        try await settle(model)
+        #expect(model.lastErrorText == nil)
+        #expect(try await repository.roots().first?.extensions == ["*"])
+        model.checkAllFileTypes = false
+        model.applyRootSettings()
+        #expect(model.lastErrorText != nil) // Empty selected-types coverage is still refused.
+    }
+
     @Test func addingFolderPreservesExistingRulesPermissionAndRelaunch() async throws {
         let fixture = try FolderFixture(); defer { fixture.remove() }
         let original = fixture.root("Media", automatic: true)
@@ -251,7 +311,8 @@ import DriveMonitorCore
     }
     private func settle(_ model: AppModel) async throws {
         for _ in 0..<200 {
-            if !model.savingConfiguration && !model.savingAutomaticSetting && !model.changingMonitoring && !model.acknowledgingBaseline { return }
+            if !model.savingConfiguration && !model.savingAutomaticSetting && !model.changingMonitoring
+                && !model.acknowledgingBaseline && !model.isScanning { return }
             try await Task.sleep(for: .milliseconds(5))
         }
         Issue.record("Settings operation did not complete.")

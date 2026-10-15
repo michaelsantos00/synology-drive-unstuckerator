@@ -336,6 +336,7 @@ public actor MonitoringEngine {
         guard metadata.canonicalPath == canonical else {
             return .blocked(reason: "The source path changed while its metadata was inspected.")
         }
+        guard metadata.size > 0 else { return .rejected(reason: "empty file") }
         var existing = previous.first { metadata.matches($0) }
         // An export's unconfirmed observation follows the file as it grows. Repair evidence
         // and confirmed versions keep their identity and history instead of being rewritten.
@@ -759,7 +760,7 @@ public actor MonitoringEngine {
     }
 
     private static func extensionIsEligible(_ url: URL, root: WatchedRootSnapshot) -> Bool {
-        root.extensions.contains { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() == url.pathExtension.lowercased() }
+        FileFormatCatalog.allows(fileExtension: url.pathExtension, extensions: root.extensions)
     }
 
     private static func isIgnored(_ url: URL, root: WatchedRootSnapshot) -> Bool {

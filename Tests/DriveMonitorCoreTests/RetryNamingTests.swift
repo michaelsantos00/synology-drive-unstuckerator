@@ -3,6 +3,15 @@ import Testing
 @testable import DriveMonitorCore
 
 @Suite struct RetryNamingTests {
+    @Test func extensionlessRetryHasNoTrailingDotEvenOnCollision() {
+        let date = Date(timeIntervalSince1970: 1_790_196_300)
+        let base = "README.__requeued-20260923-204500"
+        #expect(RetryNaming.fileName(stem: "README", extension: "", now: date, takenNames: [],
+                                    timeZone: TimeZone(secondsFromGMT: 0)!) == base)
+        #expect(RetryNaming.fileName(stem: "README", extension: "", now: date, takenNames: [base],
+                                    randomSuffix: "ab12", timeZone: TimeZone(secondsFromGMT: 0)!) == base + "-ab12")
+    }
+
     @Test func testTimestampedSiblingName() {
         let name = RetryNaming.fileName(
             stem: "EDUC - E56 - 07 Episode",

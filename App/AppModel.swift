@@ -94,6 +94,7 @@ public final class AppModel {
     public var desktopNotificationsEnabled = UserDefaults.standard.object(forKey: "desktopNotificationsEnabled") as? Bool ?? false
     public var notificationStatusText = "Permission not requested"
     public var watchedRoots: [WatchedRootSnapshot] = []
+    public var checkAllFileTypes = false
     public var enabledFormatPresets: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "formatPresets") ?? ["video"])
     public var customExtensionsText: String = UserDefaults.standard.string(forKey: "customExtensions") ?? ""
     public var ignorePatternsText = "*_segment_*,*__requeued-*,* conflicted copy*,*(conflict*"
@@ -280,7 +281,8 @@ public final class AppModel {
         minimumStableAge = root.minimumStableAge
         ignorePatternsText = root.ignorePatterns.joined(separator: ",")
         // Select only complete presets; keep partial presets as explicit extensions.
-        let saved = Set(root.extensions.map { $0.lowercased() })
+        checkAllFileTypes = root.checksAllFileTypes
+        let saved = Set(root.extensions.map { $0.lowercased() }).subtracting([FileFormatCatalog.allFilesMarker])
         enabledFormatPresets = Set(FileFormatCatalog.presets.filter { Set($0.extensions).isSubset(of: saved) }.map(\.id))
         let preset = Set(FileFormatCatalog.presets.filter { enabledFormatPresets.contains($0.id) }.flatMap(\.extensions))
         customExtensionsText = saved.subtracting(preset).sorted().joined(separator: ", ")
@@ -1032,7 +1034,7 @@ public final class AppModel {
         guard !savingAutomaticSetting, !savingConfiguration, !changingMonitoring else { return }
         guard minimumStableAge.isFinite, minimumStableAge >= 0,
               lowDiskWarningThresholdGiB.isFinite, lowDiskWarningThresholdGiB >= 0, !extensions.isEmpty else {
-            lastErrorText = "Enter a valid minimum stable age, a warning threshold, and at least one extension."
+            lastErrorText = "Enter a valid minimum stable age and warning threshold, then select All file types or at least one extension."
             return
         }
         var roots = watchedRoots
@@ -1041,7 +1043,8 @@ public final class AppModel {
             roots[index].ignorePatterns = ignorePatterns
             roots[index].minimumStableAge = minimumStableAge
         }
-        applyConfiguration(roots)
+        // Applying broader coverage should discover matching files immediately, not five minutes later.
+        applyConfiguration(roots, selecting: editingRootID)
     }
 
     public func setRootEnabled(_ id: UUID, enabled: Bool) {
@@ -1175,7 +1178,8 @@ public final class AppModel {
     }
 
     private var extensions: [String] {
-        FileFormatCatalog.extensions(enabledPresetIDs: enabledFormatPresets, customText: customExtensionsText)
+        FileFormatCatalog.extensions(enabledPresetIDs: enabledFormatPresets, customText: customExtensionsText,
+                                     allFileTypes: checkAllFileTypes)
     }
     private var ignorePatterns: [String] { ignorePatternsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty } }
 

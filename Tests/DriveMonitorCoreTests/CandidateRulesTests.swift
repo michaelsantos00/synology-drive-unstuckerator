@@ -3,6 +3,22 @@ import Testing
 @testable import DriveMonitorCore
 
 @Suite struct CandidateRulesTests {
+    @Test func allTypesIncludesDesignFilesAndExtensionlessFilesButKeepsExclusions() {
+        for name in ["Signs.PSB", "layout.af", "README"] {
+            #expect(CandidateRules.evaluate(name: name, isHidden: false, isRegularFile: true,
+                byteSize: 10, age: 400, extensions: ["*"]) == .accept)
+        }
+        for name in [".hidden", "clip_segment_1.psb", "Signs.__requeued-20261015.psb",
+                     "export.tmp", "export.part", "layout.af~lock~", "layout.idlk",
+                     "document.lock", "~$document.docx", "notes.txt~", "notes.swp",
+                     "Signs conflicted copy.psb", "Signs (conflict 1).psb"] {
+            guard case .reject = CandidateRules.evaluate(name: name, isHidden: false, isRegularFile: true,
+                byteSize: 10, age: 400, extensions: ["*"]) else {
+                Issue.record("All types must still exclude \(name)"); continue
+            }
+        }
+    }
+
     @Test func testEligibleEpisodeName() {
         let decision = CandidateRules.evaluate(
             name: "EDUC - E56 - 07 Episode.mp4",
