@@ -31,6 +31,7 @@ These rules are part of the product. They are not suggestions.
 - Files that already failed when monitoring started are `existingNeedsReview`. They are not auto-retried. The user can still press Fix.
 - Ignore names containing `_segment_`, a `.__requeued-` token, conflict-copy names, and temporary suffixes.
 - A file that is moved or deleted is not a provider failure. Its observation becomes history (Earlier Versions); ignored rows and rows with repair evidence are left as they are. If the whole watched folder is missing, nothing is changed.
+- Known non-files (including folders and named pipes), empty files, hidden trees, and package contents are exclusions, not unreadable-file alerts. Event checks enforce the same exclusions as discovery and never follow symbolic links to update a target's finding. Existing unresolved observations for confirmed ineligible paths become history once, preserving decisions and repair evidence. Unknown or unreadable metadata and incompatible provider output still block verification.
 - Dump output from `fileproviderctl dump` is aggregate and obfuscated. It must not choose a file to repair.
 
 ## Processes and commands

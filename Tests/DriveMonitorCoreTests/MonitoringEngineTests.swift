@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import Darwin
 @testable import DriveMonitorCore
 
 @Suite struct MonitoringEngineTests {
@@ -31,6 +32,85 @@ import Testing
             try await Task.sleep(for: .milliseconds(20))
         }
         #expect(await fixture.runner.paths.contains(eventFile.path))
+        await fixture.engine.stop()
+    }
+
+    @Test(arguments: [true, false]) func nonFileEventsDoNotCreateVerificationAlerts(allTypes: Bool) async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let fixture = try EngineFixture(directory: directory, extensions: allTypes ? ["*"] : ["mp4"], useProductionCandidate: true)
+        try await fixture.start()
+        let folder = directory.url.appendingPathComponent(allTypes ? "00 Archive" : "Archive.mp4")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let pipe = directory.url.appendingPathComponent("writer.mp4")
+        #expect(mkfifo(pipe.path, 0o600) == 0)
+        let empty = try directory.file("empty.mp4")
+        try Data().write(to: empty)
+        for path in [folder, pipe, empty] {
+            // handle is the same entry point reached after the watcher debounces an event.
+            _ = try await fixture.engine.handle(path: path.path)
+        }
+        #expect(try await fixture.repository.findings(matching: nil).isEmpty)
+        #expect(!(try await fixture.repository.events(limit: 50)).contains { $0.kind == .compatibility })
+        #expect(await fixture.runner.paths.isEmpty)
+        await fixture.engine.stop()
+    }
+
+    @Test func eventsRespectDiscoveryExclusionsAndDoNotFollowAliases() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let fixture = try EngineFixture(directory: directory, permanentFailure: true, extensions: ["*"], useProductionCandidate: true)
+        try await fixture.start()
+        let stable = fixture.clock.date().addingTimeInterval(-400)
+        let target = try directory.file("real.mp4", modified: stable)
+        _ = try await fixture.engine.evaluateFile(target)
+        let original = try #require(try await fixture.repository.findings(at: target.path).first)
+        let alias = directory.url.appendingPathComponent("alias.mp4")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
+        let broken = directory.url.appendingPathComponent("broken.mp4")
+        try FileManager.default.createSymbolicLink(atPath: broken.path, withDestinationPath: directory.url.appendingPathComponent("gone.mp4").path)
+        let folderAlias = directory.url.appendingPathComponent("folder-alias")
+        try FileManager.default.createSymbolicLink(at: folderAlias, withDestinationURL: directory.url)
+        var excluded = [alias, broken, folderAlias.appendingPathComponent(target.lastPathComponent)]
+        for parent in [".hidden", "Session.app"] {
+            try FileManager.default.createDirectory(at: directory.url.appendingPathComponent(parent), withIntermediateDirectories: true)
+            excluded.append(try directory.file(parent + "/internal.mp4", modified: stable))
+        }
+        for path in excluded { _ = try await fixture.engine.handle(path: path.path) }
+        #expect(try await fixture.repository.findings(matching: nil) == [original])
+        #expect(await fixture.runner.paths == [target.path])
+        await fixture.engine.stop()
+    }
+
+    @Test func recheckRetiresLegacyNonFileAlertsOnceAndPreservesDecisionsAndRepairs() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let fixture = try EngineFixture(directory: directory, extensions: ["*"], useProductionCandidate: true)
+        try await fixture.start()
+        var originals: [FindingSnapshot] = []
+        for disposition in [FindingDisposition.compatibilityBlocked, .observing, .ignored, .resolved, .requeueSucceeded, .recoveryRequired, .requeueFailed] {
+            let folder = directory.url.appendingPathComponent(disposition.rawValue)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            var finding = FindingSnapshot(id: UUID(), canonicalPath: folder.path, filename: folder.lastPathComponent,
+                rootIdentifier: fixture.root.id, fileSize: 0, modificationDate: .distantPast,
+                firstDetectedAt: fixture.clock.date(), lastCheckedAt: fixture.clock.date(), providerState: "Verification blocked",
+                confirmationCount: 0, attemptCount: 0, disposition: disposition)
+            if disposition == .recoveryRequired { finding.retryPath = folder.path + ".__requeued-123" }
+            if disposition == .requeueFailed { finding.attemptCount = 1 }
+            originals.append(finding)
+            try await fixture.repository.upsert(finding)
+        }
+        for _ in 0..<2 { try await fixture.engine.reconcile() }
+        let rows = try await fixture.repository.findings(matching: nil)
+        #expect(rows.count == originals.count)
+        for original in originals {
+            let row = try #require(rows.first { $0.id == original.id })
+            if [.compatibilityBlocked, .observing].contains(original.disposition) {
+                #expect(row.disposition == .sourceChanged)
+                #expect(row.providerState == "Not an eligible file")
+            } else { #expect(row == original) }
+        }
+        let events = try await fixture.repository.events(limit: 50)
+        #expect(events.filter { $0.kind == .lifecycle }.count == 2)
+        #expect(!events.contains { $0.kind == .compatibility })
+        #expect(await fixture.runner.paths.isEmpty)
         await fixture.engine.stop()
     }
 
