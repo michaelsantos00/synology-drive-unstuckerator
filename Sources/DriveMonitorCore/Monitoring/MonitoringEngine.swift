@@ -314,6 +314,8 @@ public actor MonitoringEngine {
         guard Self.extensionIsEligible(url, root: root), !Self.isIgnored(url, root: root) else {
             return .rejected(reason: "The extension or ignore rules exclude this path.")
         }
+        // An event for an alias must never update the finding belonging to its target.
+        guard url.path == canonical else { return .rejected(reason: "symbolic link path") }
         guard evaluating.insert(canonical).inserted else { return .blocked(reason: "An evaluation of this path is already in progress.") }
         defer { evaluating.remove(canonical) }
         let workGeneration = generation
@@ -325,7 +327,10 @@ public actor MonitoringEngine {
             $0.hasRepairEvidence && ![.requeueSucceeded, .resolved, .ignored].contains($0.disposition)
         }) else { return .blocked(reason: "A repair owns this path. Use Check upload or Recovery.") }
         let metadata: FileMetadata
-        do { metadata = try Self.metadata(url) }
+        do { metadata = try Self.metadata(url, root: root) }
+        catch let rejection as IneligibleItem {
+            return try await retireIneligible(previous: previous, reason: rejection.reason)
+        }
         catch {
             if !FileManager.default.fileExists(atPath: canonical) {
                 return try await retireMissing(path: canonical, root: root, previous: previous)
@@ -336,7 +341,6 @@ public actor MonitoringEngine {
         guard metadata.canonicalPath == canonical else {
             return .blocked(reason: "The source path changed while its metadata was inspected.")
         }
-        guard metadata.size > 0 else { return .rejected(reason: "empty file") }
         var existing = previous.first { metadata.matches($0) }
         // An export's unconfirmed observation follows the file as it grows. Repair evidence
         // and confirmed versions keep their identity and history instead of being rewritten.
@@ -396,7 +400,7 @@ public actor MonitoringEngine {
         guard started, generation == workGeneration, !Task.isCancelled else {
             return .blocked(reason: "Monitoring changed while evaluation was in progress.")
         }
-        guard let current = try? Self.metadata(url), current == metadata else {
+        guard let current = try? Self.metadata(url, root: root), current == metadata else {
             return try await block(path: canonical, root: root, metadata: metadata, previous: existing,
                                    reason: "The source version changed during evaluation.", raw: result.standardOutput)
         }
@@ -526,6 +530,24 @@ public actor MonitoringEngine {
 
     /// Provider state of an observation retired because its file left the path.
     public static let movedOrDeletedState = "Moved or deleted"
+
+    private func retireIneligible(previous: [FindingSnapshot], reason: String) async throws -> MonitoringDecision {
+        // Older builds saved folder events as unreadable files. Keep those rows as history,
+        // but never hide a decision or any evidence that a repair may have touched the path.
+        for var finding in previous where Self.isUnresolved(finding.disposition)
+            && !finding.hasRepairEvidence && finding.attemptCount == 0
+            && finding.sourceSHA256 == nil && finding.retrySHA256 == nil && finding.uploadVerifiedAt == nil {
+            finding.disposition = .sourceChanged
+            finding.lastCheckedAt = now()
+            finding.providerState = "Not an eligible file"
+            finding.eligibilityBlockReason = "This path is no longer an eligible file (\(reason)). This observation is kept as history."
+            try await store.upsert(finding)
+            try await record(.lifecycle, findingID: finding.id,
+                             summary: "\(finding.filename): not an eligible file; kept as history.",
+                             details: reason, result: finding.disposition.rawValue)
+        }
+        return .rejected(reason: reason)
+    }
 
     /// A moved or deleted file is not a provider problem. Blocking it would leave a permanent
     /// "cannot read" alert that is re-logged on every reconcile, so its observation becomes history.
@@ -813,16 +835,37 @@ public actor MonitoringEngine {
         }
     }
 
-    private static func metadata(_ url: URL) throws -> FileMetadata {
-        // A new URL avoids reusing Foundation's cached resource values across evaluations.
-        let freshURL = URL(fileURLWithPath: url.path)
-        let values = try freshURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
-        guard values.isRegularFile == true, values.isSymbolicLink == false,
-              let size = values.fileSize, let modified = values.contentModificationDate,
-              let inode = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber else {
-            throw MonitoringError.blocked(reason: "A regular local file with a known inode, size, and modification time is required.")
+    private struct IneligibleItem: Error {
+        let reason: String
+    }
+
+    private static func metadata(_ url: URL, root: WatchedRootSnapshot) throws -> FileMetadata {
+        // Known non-files are exclusions, not failures to read metadata. Unknown or unreadable
+        // metadata still throws normally and blocks verification instead of hiding a real error.
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        switch info.st_mode & S_IFMT {
+        case S_IFREG: break
+        case S_IFDIR, S_IFLNK, S_IFIFO, S_IFSOCK, S_IFCHR, S_IFBLK:
+            throw IneligibleItem(reason: "not a regular file")
+        default:
+            throw MonitoringError.blocked(reason: "The filesystem item type cannot be verified.")
         }
-        return FileMetadata(canonicalPath: url.resolvingSymlinksInPath().path, inode: inode.uint64Value, size: Int64(size), modified: modified)
+        // Discovery skips hidden trees and package descendants. Events must apply the same
+        // boundaries, since FSEvents reports individual paths inside those trees as well.
+        let rootPath = URL(fileURLWithPath: root.path).resolvingSymlinksInPath().path
+        var ancestor = url.deletingLastPathComponent()
+        while ancestor.path.hasPrefix(rootPath + "/") {
+            if ancestor.lastPathComponent.hasPrefix(".") { throw IneligibleItem(reason: "hidden folder") }
+            if try ancestor.resourceValues(forKeys: [.isPackageKey]).isPackage == true {
+                throw IneligibleItem(reason: "inside a package")
+            }
+            ancestor.deleteLastPathComponent()
+        }
+        guard info.st_size > 0 else { throw IneligibleItem(reason: "empty file") }
+        // Type, inode, size, and time come from one uncached snapshot, as in FileIntegrity.
+        return FileMetadata(canonicalPath: url.resolvingSymlinksInPath().path, inode: UInt64(info.st_ino), size: info.st_size,
+                            modified: Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9))
     }
 }
 
