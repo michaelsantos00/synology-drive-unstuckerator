@@ -241,6 +241,7 @@ struct QueueRow: View {
             Button { model.showActivity(selecting: finding.id) } label: {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: finding.statusSymbol).foregroundStyle(finding.statusTint).frame(width: 16)
+                        .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(finding.filename).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                         Text("\(model.fileLocation(finding.canonicalPath)) · \(finding.sizeText)")

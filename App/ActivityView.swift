@@ -125,6 +125,7 @@ public enum ActivityFilter: String, CaseIterable, Identifiable, Hashable, Sendab
 public struct ActivityView: View {
     @Bindable var model: AppModel
     @State private var search = ""
+    @State private var checkResult: String?
     public init(model: AppModel) { self.model = model }
 
     private var filter: ActivityFilter { model.activityFilter }
@@ -159,6 +160,9 @@ public struct ActivityView: View {
         }
         .frame(minWidth: 960, minHeight: 500)
         .task { await model.refreshRecovery() }
+        .alert("File Checked", isPresented: Binding(get: { checkResult != nil }, set: { if !$0 { checkResult = nil } })) {
+            Button("OK") {}
+        } message: { Text(checkResult ?? "") }
         .onChange(of: model.activityFilter) { _, filter in
             // Keep the inspector on a file only while the list still shows it. Event logs link to any file.
             if let id = model.activitySelection, let finding = model.findings.first(where: { $0.id == id }),
@@ -185,7 +189,10 @@ public struct ActivityView: View {
             }
             Section("History") {
                 ForEach(ActivityFilter.history) { item in
-                    Label(item.title, systemImage: item.symbolName).tag(item)
+                    // Files found at setup still need a decision, so that list shows its count.
+                    Label(item.title, systemImage: item.symbolName)
+                        .badge(item == .existing ? model.findings.filter(ActivityFilter.existing.includes).count : 0)
+                        .tag(item)
                 }
             }
         }
@@ -199,9 +206,45 @@ public struct ActivityView: View {
             EventLog(model: model, events: visibleEvents)
                 .overlay { if visibleEvents.isEmpty { emptyState } }
         } else {
-            FindingsTable(model: model, findings: visibleFindings)
-                .overlay { if visibleFindings.isEmpty { emptyState } }
+            VStack(spacing: 0) {
+                if filter == .existing && model.baselineNeedsReview {
+                    setupReviewBar
+                    Divider()
+                }
+                FindingsTable(model: model, findings: visibleFindings)
+                    .overlay { if visibleFindings.isEmpty { emptyState } }
+            }
         }
+    }
+
+    /// Reviewing what was found at setup ends here, without a trip back to Settings.
+    private var setupReviewBar: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "flag").foregroundStyle(.tint).accessibilityHidden(true)
+            Text(model.watchingFindings.isEmpty
+                 ? "Auto-fix stays off until you review these files. Files listed here always need a manual Fix."
+                 : "Some files are still being confirmed and may appear here within a minute. Files listed here always need a manual Fix.")
+                .font(.callout).fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button("Mark Setup as Reviewed") { model.acknowledgeBaseline() }
+                .disabled(model.acknowledgingBaseline || model.isScanning)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    /// Scans look at files changed in the last seven days; this checks one older file on request.
+    private func chooseFileToCheck() {
+        let panel = NSOpenPanel()
+        panel.title = "Check a File"
+        panel.message = "Choose a file in a watched folder. Files of any age are checked."
+        panel.prompt = "Check"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = model.watchedRoots.first(where: \.enabled).map { URL(fileURLWithPath: $0.path, isDirectory: true) }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { checkResult = await model.checkFile(url) }
     }
 
     @ViewBuilder private var emptyState: some View {
@@ -213,7 +256,10 @@ public struct ActivityView: View {
     }
 
     private var subtitle: String {
-        if filter == .recovery { return "\(model.recoveryFiles.count) retained" }
+        if filter == .recovery {
+            let review = model.recoveryReviewCount
+            return "\(model.recoveryFiles.count) retained" + (review > 0 ? " · \(review) to review" : "")
+        }
         if filter.showsEvents { return visibleEvents.count == 1 ? "1 event" : "\(visibleEvents.count) events" }
         return visibleFindings.count == 1 ? "1 file" : "\(visibleFindings.count) files"
     }
@@ -226,6 +272,9 @@ public struct ActivityView: View {
             .keyboardShortcut(model.isScanning ? "." : "r", modifiers: .command)
             .disabled(!model.isScanning && (model.needsRootConfirmation || model.savingConfiguration))
             .help(model.isScanning ? "Stop the scan in progress (⌘.)" : "Check watched folders now (⌘R)")
+            Button { chooseFileToCheck() } label: { Label("Check File…", systemImage: "doc.text.magnifyingglass") }
+                .disabled(model.needsRootConfirmation || model.savingConfiguration)
+                .help("Check one file now, including files older than a week")
             Button { model.togglePause() } label: {
                 Label(model.isPaused ? "Resume Monitoring" : "Pause Monitoring", systemImage: model.isPaused ? "play" : "pause")
             }
@@ -372,7 +421,7 @@ struct RecoveryList: View {
     private var files: [RecoveryFile] {
         model.recoveryFiles.filter { matches($0.record.originalPath, $0.url.lastPathComponent) }
     }
-    private var unreadable: [URL] { model.unreadableOperationFiles + model.unreadableArchiveFiles.filter { matches($0.lastPathComponent) } }
+    private var unreadable: [URL] { (model.unreadableOperationFiles + model.unreadableArchiveFiles).filter { matches($0.lastPathComponent) } }
     /// Rows waiting for recovery review that no operation record lists, such as migrated older repairs.
     private var reviews: [FindingSnapshot] {
         let listed = Set(operations.compactMap { $0.finding?.id })
@@ -464,6 +513,7 @@ struct RecoveryList: View {
 struct OperationRow: View {
     @Bindable var model: AppModel
     let operation: RequeueJournal
+    @State private var confirmClose = false
 
     private var paths: [String] {
         Array(Set([operation.source.canonicalPath, operation.publishedPath, operation.stagedPath].compactMap { $0 })).sorted()
@@ -493,8 +543,20 @@ struct OperationRow: View {
                 }
                 .fixedSize()
                 .accessibilityLabel("Reveal files for \(name) in Finder")
+                // A stop before publication is closed here, whatever later repairs did to the file's row.
+                if AppModel.retainsStagedCopy(operation) {
+                    Button("Retain Staged Copy and Close…") { confirmClose = true }
+                        .disabled(!model.requeueInFlight.isEmpty)
+                        .accessibilityLabel("Retain the staged copy of \(name) and close this stopped repair")
+                }
             }
             .controlSize(.small)
+            .confirmationDialog("Close this stopped repair?", isPresented: $confirmClose) {
+                Button("Retain Staged Copy and Close") { model.closeStoppedRepair(operation.id) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The staged copy moves to Retained Files, where you can export or remove it. The file and any later repair are not changed.")
+            }
         }
         .padding(.vertical, 4)
     }

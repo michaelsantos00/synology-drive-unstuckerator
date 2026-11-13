@@ -148,7 +148,10 @@ import Darwin
         try await fixture.start()
         _ = try await fixture.engine.evaluateFile(file)
         _ = try await fixture.engine.evaluateFile(kept)
-        let observed = try #require(try await fixture.repository.findings(at: file.path).first)
+        // A row that has seen a failure; a row that only waited to settle is removed instead (tested separately).
+        var observed = try #require(try await fixture.repository.findings(at: file.path).first)
+        observed.providerState = "Permanent upload failure"; observed.errorCode = -2005; observed.confirmationCount = 1
+        try await fixture.repository.upsert(observed)
         var ignored = try #require(try await fixture.repository.findings(at: kept.path).first)
         ignored.disposition = .ignored
         try await fixture.repository.upsert(ignored)
@@ -594,7 +597,7 @@ private struct EngineFixture {
     let root: WatchedRootSnapshot
     let engine: MonitoringEngine
 
-    init(directory: TestDirectory, permanentFailure: Bool = false, downloaded: Bool = true, failure: FixtureRunner.Failure? = nil, minimumStableAge: TimeInterval = 0, access: RepairAccess = RepairAccess(), forcedClassification: EvaluationClassification? = nil, extensions: [String] = ["mp4"], useProductionCandidate: Bool = false, store makeStore: ((FindingRepository) -> any FindingStoring)? = nil) throws {
+    init(directory: TestDirectory, permanentFailure: Bool = false, downloaded: Bool = true, failure: FixtureRunner.Failure? = nil, minimumStableAge: TimeInterval = 0, access: RepairAccess = RepairAccess(), forcedClassification: EvaluationClassification? = nil, extensions: [String] = ["mp4"], useProductionCandidate: Bool = false, missingItem: Bool = false, store makeStore: ((FindingRepository) -> any FindingStoring)? = nil) throws {
         let repository = try FindingRepository(inMemory: true)
         let runner = FixtureRunner(failure: failure)
         let watcher = MemoryWatcher()
@@ -608,6 +611,7 @@ private struct EngineFixture {
         let interpreting = EvaluationInterpreting(
             parse: { output in
                 guard output == FixtureRunner.uploaded else { return .incompatible(reason: "Unknown fixture output.") }
+                if missingItem { return .missingItem }
                 return .item(FileProviderItemState(isDownloaded: downloaded, isUploaded: !permanentFailure,
                     itemIdentifier: "fixture-item", uploadingErrorDomain: permanentFailure ? "NSFileProviderErrorDomain" : nil,
                     uploadingErrorCode: permanentFailure ? -2005 : nil))
@@ -663,6 +667,7 @@ private struct FailingLookups: FindingStoring {
     func findings(matching disposition: FindingDisposition?) async throws -> [FindingSnapshot] { try await base.findings(matching: disposition) }
     func findings(at path: String) async throws -> [FindingSnapshot] { throw CocoaError(.fileReadUnknown) }
     func append(_ event: ActivityEvent) async throws { try await base.append(event) }
+    func remove(id: UUID) async throws { try await base.remove(id: id) }
 }
 
 private final class MemoryWatcher: DirectoryWatching, @unchecked Sendable {
@@ -714,4 +719,224 @@ private final class TestClock: @unchecked Sendable {
         #expect(after > before)
         await fixture.engine.stop()
     }
+}
+
+@Suite struct QuietMonitoringTests {
+    private func trackedRow(_ file: URL, root: WatchedRootSnapshot, disposition: FindingDisposition,
+                            confirmations: Int, attempts: Int = 0) throws -> FindingSnapshot {
+        let identity = try FileIntegrity.sourceVersion(file)
+        var row = FindingSnapshot(id: UUID(), canonicalPath: identity.canonicalPath, filename: file.lastPathComponent,
+            rootIdentifier: root.id, inode: identity.inode, fileSize: identity.fileSize, modificationDate: identity.modificationTime,
+            firstDetectedAt: Date(), lastCheckedAt: Date(), providerState: "Permanent upload failure",
+            confirmationCount: confirmations, attemptCount: attempts, disposition: disposition)
+        row.errorDomain = "NSFileProviderErrorDomain"; row.errorCode = -2005; row.lastConfirmedAt = Date()
+        return row
+    }
+
+    @Test func aFileThatOnlyWaitedToSettleLeavesNoRowOnceUploaded() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("draft.mp4")
+        let fixture = try EngineFixture(directory: directory, minimumStableAge: 300)
+        try await fixture.start()
+        _ = try await fixture.engine.evaluateFile(file)
+        #expect(try await fixture.repository.findings(matching: .observing).count == 1)
+        fixture.clock.advance(301)
+        _ = try await fixture.engine.handle(path: file.path)
+        #expect(try await fixture.repository.findings(matching: nil).isEmpty)
+        #expect(!(try await fixture.repository.events(limit: 20)).contains { $0.findingID != nil })
+        await fixture.engine.stop()
+    }
+
+    @Test func scheduledScansReuseAnUploadedResultUntilItExpires() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        _ = try directory.file("healthy.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory)
+        try await fixture.start()
+        try await fixture.engine.reconcile()
+        try await fixture.engine.reconcile()
+        #expect(await fixture.runner.paths.count == 1)
+        try await fixture.engine.scanNow() // the user asking always checks again
+        #expect(await fixture.runner.paths.count == 2)
+        fixture.clock.advance(MonitoringEngine.uploadedCacheLifetime + 1)
+        try await fixture.engine.reconcile()
+        #expect(await fixture.runner.paths.count == 3)
+        await fixture.engine.stop()
+    }
+
+    @Test func anUnresponsiveProviderStopsTheScanWithoutRaisingAlerts() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        for index in 0..<6 { _ = try directory.file("file\(index).mp4", modified: Date().addingTimeInterval(-3600)) }
+        let fixture = try EngineFixture(directory: directory, failure: .throwsError)
+        try await fixture.start()
+        await #expect(throws: ProviderUnresponsiveError.self) { try await fixture.engine.scanNow() }
+        #expect(await fixture.runner.paths.count == MonitoringEngine.providerFailureLimit)
+        #expect(try await fixture.repository.findings(matching: nil).isEmpty)
+        await fixture.engine.stop()
+    }
+
+    @Test func anOfflineReadingKeepsAConfirmedFailureListed() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory, forcedClassification: .uploadError(domain: "NSURLErrorDomain", code: -1009))
+        try await fixture.start()
+        try await fixture.repository.upsert(try trackedRow(file, root: fixture.root, disposition: .actionable, confirmations: 2))
+        try await fixture.engine.reconcile()
+        let row = try #require(try await fixture.repository.findings(matching: nil).first)
+        #expect(row.disposition == .actionable && row.confirmationCount == 2 && row.errorCode == -2005)
+        #expect(row.providerState.contains("-1009"))
+        await fixture.engine.stop()
+    }
+
+    @Test func backgroundChecksLeaveAStoppedRepairForReview() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory, permanentFailure: true)
+        try await fixture.start()
+        let stopped = try trackedRow(file, root: fixture.root, disposition: .requeueFailed, confirmations: 2, attempts: 1)
+        try await fixture.repository.upsert(stopped)
+        try await fixture.engine.reconcile()
+        _ = try await fixture.engine.handle(path: file.path)
+        #expect(await fixture.runner.paths.isEmpty)
+        #expect(try await fixture.repository.finding(id: stopped.id)?.disposition == .requeueFailed)
+        _ = try await fixture.engine.evaluateFile(file) // Check Again
+        #expect(await fixture.runner.paths.count == 1)
+        await fixture.engine.stop()
+    }
+
+    @Test func aFileBlockedForTheSameReasonIsLoggedOnce() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4")
+        let fixture = try EngineFixture(directory: directory, failure: .incompatible)
+        try await fixture.start()
+        for _ in 0..<3 { _ = try await fixture.engine.evaluateFile(file) }
+        #expect(try await fixture.repository.events(limit: 20).filter { $0.kind == .compatibility }.count == 1)
+        await fixture.engine.stop()
+    }
+
+    @Test func aHealthyCheckDoesNotRefreshTheInterface() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory)
+        try await fixture.start()
+        let refreshes = RefreshCounter()
+        await fixture.engine.setPathChangeHandler { _ in refreshes.increment() }
+        _ = try await fixture.engine.handle(path: file.path)
+        #expect(await fixture.runner.paths.count == 1)
+        #expect(refreshes.value == 0)
+        await fixture.engine.stop()
+    }
+
+    @Test func unreadableEntriesAreReportedInTheScanSummary() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let locked = directory.url.appendingPathComponent("locked", isDirectory: true)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try Data("hidden".utf8).write(to: locked.appendingPathComponent("inside.mp4"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+        let fixture = try EngineFixture(directory: directory)
+        try await fixture.start()
+        try await fixture.engine.scanNow()
+        let scan = try #require(try await fixture.repository.events(limit: 10).first { $0.kind == .scan })
+        #expect(scan.summary.contains("could not be read"))
+        #expect(scan.details?.contains("locked") == true)
+        await fixture.engine.stop()
+    }
+}
+
+@Suite struct ConfirmedFailureReadingTests {
+    private func confirmedRow(_ file: URL, root: WatchedRootSnapshot, disposition: FindingDisposition = .actionable) throws -> FindingSnapshot {
+        let identity = try FileIntegrity.sourceVersion(file)
+        var row = FindingSnapshot(id: UUID(), canonicalPath: identity.canonicalPath, filename: file.lastPathComponent,
+            rootIdentifier: root.id, inode: identity.inode, fileSize: identity.fileSize, modificationDate: identity.modificationTime,
+            firstDetectedAt: Date(), lastCheckedAt: Date(), providerState: "Permanent upload failure",
+            confirmationCount: disposition == .observing ? 1 : 2, attemptCount: 0, disposition: disposition)
+        row.errorDomain = "NSFileProviderErrorDomain"; row.errorCode = -2005; row.lastConfirmedAt = Date()
+        return row
+    }
+
+    @Test func aPausedReadingOfAnUntrackedFileIsQuietAndDoesNotCrash() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory, forcedClassification: .syncPaused)
+        try await fixture.start()
+        try await fixture.engine.scanNow()
+        _ = try await fixture.engine.evaluateFile(file)
+        #expect(try await fixture.repository.findings(matching: nil).isEmpty)
+        await fixture.engine.stop()
+    }
+
+    @Test func aPausedReadingStillDemotesAnUnconfirmedRow() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory, forcedClassification: .syncPaused)
+        try await fixture.start()
+        try await fixture.repository.upsert(try confirmedRow(file, root: fixture.root, disposition: .observing))
+        _ = try await fixture.engine.evaluateFile(file)
+        let row = try #require(try await fixture.repository.findings(matching: nil).first)
+        #expect(row.disposition == .observing && row.confirmationCount == 0)
+        #expect(row.eligibilityBlockReason?.contains("stays listed") != true)
+        await fixture.engine.stop()
+    }
+
+    @Test(arguments: [true, false]) func aMissingItemOrFailedCheckKeepsAConfirmedFailure(commandFails: Bool) async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory, failure: commandFails ? .throwsError : nil, missingItem: !commandFails)
+        try await fixture.start()
+        for disposition in [FindingDisposition.actionable, .existingNeedsReview] {
+            let confirmed = try confirmedRow(file, root: fixture.root, disposition: disposition)
+            try await fixture.repository.upsert(confirmed)
+            _ = try await fixture.engine.evaluateFile(file)
+            let row = try #require(try await fixture.repository.finding(id: confirmed.id))
+            #expect(row.disposition == disposition && row.confirmationCount == 2 && row.errorCode == -2005)
+            #expect(row.eligibilityBlockReason?.contains("stays listed") == true)
+            try await fixture.repository.remove(id: confirmed.id)
+        }
+        #expect(!(try await fixture.repository.events(limit: 20)).contains { $0.kind == .compatibility })
+        await fixture.engine.stop()
+    }
+
+    @Test func aMissingItemForAnUntrackedFileCreatesNoAlertDuringScans() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        _ = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory, missingItem: true)
+        try await fixture.start()
+        try await fixture.engine.scanNow()
+        #expect(try await fixture.repository.findings(matching: nil).isEmpty)
+        await fixture.engine.stop()
+    }
+
+    @Test func aStoppedRepairForADeletedFileBecomesHistory() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("episode.mp4", modified: Date().addingTimeInterval(-3600))
+        let fixture = try EngineFixture(directory: directory)
+        try await fixture.start()
+        var stopped = try confirmedRow(file, root: fixture.root); stopped.disposition = .requeueFailed; stopped.attemptCount = 1
+        try await fixture.repository.upsert(stopped)
+        try FileManager.default.removeItem(at: file)
+        _ = try await fixture.engine.handle(path: file.path)
+        #expect(try await fixture.repository.finding(id: stopped.id)?.disposition == .sourceChanged)
+        await fixture.engine.stop()
+    }
+
+    @Test func aFileDeletedDuringItsStabilityWaitLeavesNoHistory() async throws {
+        let directory = try TestDirectory(); defer { directory.remove() }
+        let file = try directory.file("scratch.mp4")
+        let fixture = try EngineFixture(directory: directory, minimumStableAge: 300)
+        try await fixture.start()
+        _ = try await fixture.engine.evaluateFile(file)
+        #expect(try await fixture.repository.findings(matching: .observing).count == 1)
+        try FileManager.default.removeItem(at: file)
+        _ = try await fixture.engine.handle(path: file.path)
+        #expect(try await fixture.repository.findings(matching: nil).isEmpty)
+        #expect(!(try await fixture.repository.events(limit: 20)).contains { $0.kind == .lifecycle })
+        await fixture.engine.stop()
+    }
+}
+
+private final class RefreshCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
 }

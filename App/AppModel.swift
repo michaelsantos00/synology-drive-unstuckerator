@@ -37,6 +37,9 @@ public struct MonitorCallbacks {
     public var saveRoot: ((WatchedRootSnapshot) async throws -> Void)?
     public var acknowledgeBaseline: ((UUID, Date) async throws -> Void)?
     public var exportDiagnostic: ((String) throws -> Void)?
+    /// Checks one file now, whatever its age, and returns the decision and that path's rows.
+    public var checkFile: ((String) async throws -> (MonitoringDecision, [FindingSnapshot]))?
+    public var closeStoppedRepair: ((UUID) async throws -> Void)?
     public init() {}
 }
 
@@ -101,7 +104,9 @@ public final class AppModel {
     public var minimumStableAge: Double = 300
     public var reconciliationInterval: Double = 300
     public var lowDiskWarningThresholdGiB: Double = UserDefaults.standard.object(forKey: "lowDiskWarningThresholdGiB") as? Double ?? 100
-    public var showRawPaths = true
+    /// A Settings tab another window asked for; Settings selects it and clears the request.
+    public var requestedSettingsSection: MonitorSettingsSection?
+    public var showRawPaths = UserDefaults.standard.object(forKey: "showRawPaths") as? Bool ?? true
     public var needsRootConfirmation = true
     public private(set) var launchAtLogin = false
     public private(set) var launchAtLoginNeedsApproval = false
@@ -119,6 +124,8 @@ public final class AppModel {
     public private(set) var isRestoring = true
 
     @ObservationIgnored private let pickFolder: () -> URL?
+    /// Why a folder cannot be watched, checked for every way of adding one (panel, drag and drop, setup).
+    @ObservationIgnored private let folderRejection: (URL) -> String?
     @ObservationIgnored private let callbacks: MonitorCallbacks
     @ObservationIgnored private var pendingPresentation: AppWindowID?
     /// Installed by the always-visible menu-bar label, which owns an `openWindow` action.
@@ -130,8 +137,10 @@ public final class AppModel {
         }
     }
 
-    public init(pickFolder: @escaping () -> URL? = { nil }, callbacks: MonitorCallbacks = MonitorCallbacks()) {
+    public init(pickFolder: @escaping () -> URL? = { nil }, folderRejection: @escaping (URL) -> String? = { _ in nil },
+                callbacks: MonitorCallbacks = MonitorCallbacks()) {
         self.pickFolder = pickFolder
+        self.folderRejection = folderRejection
         self.callbacks = callbacks
         automaticRevoked = callbacks.loadAutomaticRevocation?() ?? false
         refreshLaunchAtLoginStatus()
@@ -183,9 +192,21 @@ public final class AppModel {
         AccessibilityNotification.Announcement(text).post()
     }
 
-    /// Operations that stopped or were interrupted; in-flight repairs are not something to review.
+    /// Operations that were interrupted, or stopped while keeping a staged copy for inspection. In-flight
+    /// repairs, and stops that left nothing behind (a cross-volume block, a failure before copying), are not.
     public static func needsReview(_ operation: RequeueJournal) -> Bool {
-        [.recoveryRequired, .failed].contains(operation.phase)
+        operation.phase == .recoveryRequired || retainsStagedCopy(operation)
+    }
+
+    /// A repair that stopped before publication keeps its private staged copy until the user reviews it.
+    public static func retainsStagedCopy(_ operation: RequeueJournal) -> Bool {
+        operation.phase == .failed && operation.stagedPath.map { FileManager.default.fileExists(atPath: $0) } == true
+    }
+
+    /// Whether this file has a stopped repair whose staged copy still waits for a recovery choice,
+    /// even after Check Again or a later repair moved the row itself on.
+    public func hasRetainedStagedCopy(_ finding: FindingSnapshot) -> Bool {
+        repairOperations.contains { $0.finding?.id == finding.id && Self.retainsStagedCopy($0) }
     }
 
     /// What the Recovery badge counts: repairs to review, plus review rows no operation lists.
@@ -369,11 +390,9 @@ public final class AppModel {
     public var baselineNeedsReview: Bool { watchedRoots.contains { $0.enabled && $0.baselineCompletedAt == nil } }
     public var lowDiskWarning: String? {
         guard let availableDiskBytes else { return nil }
-        let threshold = max(100, lowDiskWarningThresholdGiB) * 1_073_741_824
-        guard Double(availableDiskBytes) < threshold else { return nil }
-        return availableDiskBytes < 100 * 1_073_741_824
-            ? "Less than 100 GiB free on the watched volume. This warning is display only."
-            : "Free space is below your \(Int(max(100, lowDiskWarningThresholdGiB))) GiB warning threshold."
+        let gib = max(Self.minimumDiskWarningGiB, lowDiskWarningThresholdGiB)
+        guard Double(availableDiskBytes) < gib * 1_073_741_824 else { return nil }
+        return "Free space is below your \(Int(gib)) GiB warning threshold. Each repair still checks the space it needs before copying."
     }
 
     public func restoreSavedMonitoring() async {
@@ -486,6 +505,15 @@ public final class AppModel {
         notificationStatusText = authorization.description
     }
 
+    /// Saved, so a choice to redact paths (including in diagnostics) survives relaunch.
+    public func setShowRawPaths(_ value: Bool) {
+        showRawPaths = value
+        UserDefaults.standard.set(value, forKey: "showRawPaths")
+    }
+
+    /// The smallest warning threshold; a cloned repair needs about the 20 GiB reserve, not 100 GiB.
+    public static let minimumDiskWarningGiB: Double = 20
+
     public func setLowDiskWarningThreshold(_ value: Double) {
         guard value.isFinite, value >= 0 else { lastErrorText = "Enter a valid disk warning threshold."; return }
         lowDiskWarningThresholdGiB = value
@@ -535,6 +563,7 @@ public final class AppModel {
     private func validatedFolder(_ url: URL) -> URL? {
         guard url.isFileURL else { lastErrorText = "Choose a local folder."; return nil }
         let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        if let reason = folderRejection(canonical) { lastErrorText = reason; return nil }
         guard !FileManager.default.fileExists(atPath: canonical.appendingPathComponent(".git").path) else {
             lastErrorText = "A repository cannot be used as a watched folder."
             return nil
@@ -614,7 +643,7 @@ public final class AppModel {
                     assignFindings(scanned)
                     lastScanDate = Date()
                     finished = true
-                    append(.scan, "Recent-file scan completed.")
+                    // The engine records the scan (with its counts and any gaps); a second line here would duplicate it.
                 } else {
                     append(.compatibility, "Scan blocked: the monitoring engine is not connected.")
                 }
@@ -654,6 +683,33 @@ public final class AppModel {
         }
     }
 
+    /// Checks one chosen file now, whatever its age. Scans only look at files changed in the last seven days,
+    /// so this is how an older stuck file is found. A failure still needs its second check a minute later.
+    /// Returns a message to show when there is no file row to select.
+    public func checkFile(_ url: URL) async -> String? {
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        guard !needsRootConfirmation, !watchedRoots.isEmpty else { return "Choose and confirm a watched folder first." }
+        guard watchedRoots.contains(where: {
+            $0.enabled && path.hasPrefix(URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path + "/")
+        }) else { return "Choose a file inside a watched folder that is turned on." }
+        guard let check = callbacks.checkFile else { return "Monitoring is not connected." }
+        do {
+            let (decision, rows) = try await check(path)
+            applyPathUpdate(path: path, findings: rows)
+            let current = rows.filter { $0.disposition != .sourceChanged }.max { $0.lastCheckedAt < $1.lastCheckedAt }
+            guard let current else {
+                switch decision {
+                case .rejected(let reason), .blocked(let reason): return reason
+                case .evaluated: return "Synology Drive reports no stuck upload for \(url.lastPathComponent)."
+                }
+            }
+            showActivity(selecting: current.id)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     public func recheck(id: UUID) {
         if let finding = findings.first(where: { $0.id == id }), finding.disposition == .requeueUploading {
             requeue(id: id)
@@ -680,7 +736,9 @@ public final class AppModel {
     public func canRequeue(_ finding: FindingSnapshot) -> Bool {
         guard !isBusy(finding), requeueInFlight.isEmpty, unreadableOperationFiles.isEmpty else { return false }
         if finding.disposition == .requeueUploading { return finding.retryPath != nil }
-        if finding.disposition == .requeueSucceeded { return repairOperations.first { $0.finding?.id == finding.id }?.finalPathVerifiedAt == nil }
+        if finding.disposition == .requeueSucceeded {
+            return repairOperations.first { $0.finding?.id == finding.id && $0.phase == .succeeded }?.finalPathVerifiedAt == nil
+        }
         guard !findings.contains(where: {
             $0.id != finding.id && $0.canonicalPath == finding.canonicalPath && $0.hasRepairEvidence
                 && ![.requeueSucceeded, .resolved, .ignored].contains($0.disposition)
@@ -738,6 +796,20 @@ public final class AppModel {
                 if let saved = try await callbacks.loadFindings?() { assignFindings(saved, fromSnapshot: false) }
             } catch { lastErrorText = error.localizedDescription }
             await refreshRecovery()
+        }
+    }
+
+    /// Closes a repair that stopped before publication, from its own row in Retained Files: its staged copy moves to
+    /// retained storage. The file's row and any newer repair are unchanged.
+    public func closeStoppedRepair(_ operationID: UUID) {
+        guard let close = callbacks.closeStoppedRepair, !requeueInFlight.contains(operationID) else { return }
+        requeueInFlight.insert(operationID)
+        Task {
+            defer { requeueInFlight.remove(operationID); refreshStatus() }
+            do { try await close(operationID) } catch { lastErrorText = error.localizedDescription }
+            if let saved = try? await callbacks.loadFindings?() { assignFindings(saved, fromSnapshot: false) }
+            await refreshRecovery()
+            refreshStatus()
         }
     }
 

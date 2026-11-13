@@ -320,6 +320,14 @@ enum FileIdentity {
     }
 }
 
+public enum ContentDigest {
+    /// Whether the file's bytes match `digest`. A digest already confirmed in this process for the same full
+    /// identity (including change time, which every write moves) is reused instead of re-reading the bytes.
+    public static func matches(_ url: URL, digest: String, effects: RequeueEffects = .system()) async throws -> Bool {
+        try await VerifiedDigests.shared.verify(url, identity: FileIntegrity.identity(url), digest: digest, effects: effects)
+    }
+}
+
 /// Digests already confirmed in this process, keyed by full identity including change time.
 /// The kernel moves change time on every write and a writer cannot set it, so an identical
 /// identity means the bytes were not rewritten. Only repeat pre-checks use this: acknowledgement,

@@ -55,8 +55,16 @@ public struct WelcomeView: View {
             if configured {
                 NoticeView(symbol: "checkmark.circle.fill", tint: .green,
                            text: "Watching \(model.watchedFolderSummary). Video files are checked by default; change file types in Settings → Folders.")
+                // A monitor's main signal is a stuck file; offer the alert here instead of only in Settings.
+                Toggle("Notify me when a file needs attention",
+                       isOn: Binding(get: { model.desktopNotificationsEnabled }, set: { model.setNotificationsEnabled($0) }))
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 HStack {
-                    Button("Open Settings…") { NSApp.activate(); openSettings() }
+                    Button("Open Folder Settings…") {
+                        model.requestedSettingsSection = .folders
+                        NSApp.activate(); openSettings()
+                        dismissWindow(id: AppWindowID.welcome.rawValue)
+                    }
                     Spacer()
                     Button("Done") { dismissWindow(id: AppWindowID.welcome.rawValue) }
                         .keyboardShortcut(.defaultAction)

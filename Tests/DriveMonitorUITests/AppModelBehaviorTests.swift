@@ -152,6 +152,45 @@ import DriveMonitorCore
         #expect(finding.statusText == "Confirming failure")
     }
 
+    @Test func aStoppedRepairNeedsReviewOnlyWhileItKeepsAStagedCopy() throws {
+        let staged = FileManager.default.temporaryDirectory.appendingPathComponent("staged-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: staged) }
+        var stopped = RequeueJournal(id: UUID(), phase: .failed,
+            source: SourceVersionKey(canonicalPath: "/fixture/file.mp4", inode: 1, fileSize: 10, modificationTime: Date()),
+            stagedPath: staged.path, updatedAt: Date())
+        #expect(!AppModel.needsReview(stopped)) // nothing was left behind
+        try Data("copy".utf8).write(to: staged)
+        #expect(AppModel.needsReview(stopped))
+        stopped.stagedPath = nil
+        #expect(!AppModel.needsReview(stopped))
+        stopped.phase = .recoveryRequired
+        #expect(AppModel.needsReview(stopped))
+    }
+
+    @Test func checkFileSelectsTheCheckedFileOrExplainsTheResult() async throws {
+        let folder = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("check-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let watched = WatchedRootSnapshot(id: UUID(), path: folder.path, displayName: "Fixture", enabled: true, extensions: ["mp4"],
+            ignorePatterns: [], minimumStableAge: 300, automaticRequeueEnabled: false, baselineCompletedAt: Date())
+        let old = folder.appendingPathComponent("old.mp4")
+        let row = FindingSnapshot(id: UUID(), canonicalPath: old.path, filename: "old.mp4", rootIdentifier: watched.id,
+            inode: 1, fileSize: 10, modificationDate: Date().addingTimeInterval(-30 * 86_400), firstDetectedAt: Date(),
+            lastCheckedAt: Date(), providerState: "Permanent upload failure", confirmationCount: 1, attemptCount: 0, disposition: .observing)
+        var rows: [FindingSnapshot] = []
+        var callbacks = MonitorCallbacks()
+        callbacks.loadRoots = { [watched] }
+        callbacks.start = { _ in }
+        callbacks.checkFile = { _ in (.evaluated, rows) }
+        let model = AppModel(callbacks: callbacks); model.desktopNotificationsEnabled = false
+        await model.restoreSavedMonitoring()
+        #expect(await model.checkFile(old) == "Synology Drive reports no stuck upload for old.mp4.")
+        rows = [row]
+        #expect(await model.checkFile(old) == nil)
+        #expect(model.activitySelection == row.id && model.findings.contains { $0.id == row.id })
+        #expect(await model.checkFile(URL(fileURLWithPath: "/elsewhere/file.mp4")) != nil)
+    }
+
     @Test func clearHistoryKeepsDecisionRowsInMemory() {
         let model = AppModel.preview()
         var ignored = try! #require(model.findings.first { $0.disposition == .observing })

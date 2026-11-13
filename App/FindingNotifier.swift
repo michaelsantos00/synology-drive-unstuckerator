@@ -64,7 +64,10 @@ public enum FindingNotifier {
             }
             content.sound = .default
             content.threadIdentifier = "findings"
-            let request = UNNotificationRequest(identifier: "drive-status", content: content, trigger: nil)
+            // One identifier per file: a newer alert about the same file replaces its older one, but alerts
+            // about other files stay in Notification Center. Batches get their own.
+            let identifier = notices.count == 1 ? notices[0].findingID?.uuidString ?? UUID().uuidString : UUID().uuidString
+            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
             try? await UNUserNotificationCenter.current().add(request)
         }
     }

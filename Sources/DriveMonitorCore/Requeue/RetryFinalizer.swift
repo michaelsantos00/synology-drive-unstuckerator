@@ -107,7 +107,13 @@ public struct RetryFinalizer: Sendable {
     }
 }
 
-public enum RetryFinalizerError: Error, Equatable {
+public enum RetryFinalizerError: Error, Equatable, LocalizedError {
     case unreadable(String)
     case destinationOccupied(String)
+    public var errorDescription: String? {
+        switch self {
+        case .unreadable(let path): "\(URL(fileURLWithPath: path).lastPathComponent) is not a readable file, or something other than a file is at its path."
+        case .destinationOccupied(let path): "Something is already at \(URL(fileURLWithPath: path).lastPathComponent); nothing was overwritten."
+        }
+    }
 }

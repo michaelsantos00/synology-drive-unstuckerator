@@ -64,6 +64,23 @@ import DriveMonitorCore
         #expect(model.lastErrorText != nil) // Empty selected-types coverage is still refused.
     }
 
+    @Test func droppedFolderOutsideSynologyDriveIsRefused() async throws {
+        let fixture = try FolderFixture(); defer { fixture.remove() }
+        let original = fixture.root("Media", automatic: false)
+        let repository = try FindingRepository(inMemory: true)
+        try await repository.save(root: original)
+        let model = AppModel(folderRejection: { $0.lastPathComponent == "Downloads" ? "Choose a folder inside Synology Drive." : nil },
+                             callbacks: callbacks(repository))
+        model.desktopNotificationsEnabled = false
+        await model.restoreSavedMonitoring()
+        let outside = fixture.url.appendingPathComponent("Downloads")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        model.addRoot(outside) // the path drag and drop takes
+        try await settle(model)
+        #expect(model.watchedRoots == [original])
+        #expect(model.lastErrorText == "Choose a folder inside Synology Drive.")
+    }
+
     @Test func addingFolderPreservesExistingRulesPermissionAndRelaunch() async throws {
         let fixture = try FolderFixture(); defer { fixture.remove() }
         let original = fixture.root("Media", automatic: true)

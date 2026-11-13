@@ -50,7 +50,10 @@ public final class MonitorSession {
                     guard let id = operation.finding?.id else { continue }
                     var check = env
                     check.maxPolls = 1
-                    _ = try? await ManualRequeueAction.perform(id: id, repository: repository, environment: check)
+                    do { _ = try await ManualRequeueAction.perform(id: id, repository: repository, environment: check) }
+                    // A Fix or Check Upload is checking this file right now. Look again next pass without backing off.
+                    catch RepairAccessError.busy { continue }
+                    catch {}
                     let phase = (try? env.operations.knownRecords().first { $0.id == operation.id }?.phase) ?? operation.phase
                     let interval = schedule[operation.id].map { $0.phase == phase ? min($0.interval * 2, 600) : 60 } ?? 60
                     schedule[operation.id] = (Date().addingTimeInterval(interval), interval, phase)
@@ -123,16 +126,26 @@ public final class MonitorSession {
         callbacks.resolveRecovery = { [repository] id, choice in
             guard let finding = try await repository.finding(id: id) else { return nil }
             let result = try await recovery.resolve(finding, choice: choice)
-            if let closed = try await offMainActor({ try env.operations.records().first(where: { $0.finding?.id == id })?.finding }) {
+            // Only a choice that created a fresh observation closes a row; the closed snapshot belongs to that operation.
+            if result.id != id, let closed = try await offMainActor({
+                try env.operations.records().first(where: { $0.nextFinding?.id == result.id })?.finding
+            }) {
                 try await repository.upsert(closed)
             }
-            try await repository.upsert(result)
+            // When the row was left as it is, its stored state is current; writing back the copy read before the
+            // path lock could undo a check that finished in between.
+            if result.id != id { try await repository.upsert(result) }
             return result
         }
+        callbacks.closeStoppedRepair = { id in try await recovery.closeStopped(operationID: id) }
         callbacks.recheck = { [engine, repository] id in
             guard let finding = try await repository.finding(id: id) else { return nil }
             _ = try await engine.evaluateFile(finding.canonicalPath)
             return try await repository.finding(id: id)
+        }
+        callbacks.checkFile = { [engine, repository] path in
+            let decision = try await engine.evaluateFile(path)
+            return (decision, try await repository.findings(at: path))
         }
         callbacks.saveFinding = { [repository] in try await repository.upsert($0) }
         callbacks.saveRoot = { [repository] in try await repository.save(root: $0) }
@@ -172,14 +185,21 @@ public final class MonitorSession {
     /// Installs the engine and progress hooks. Await it before restoring, so early updates are not dropped.
     public func attach(_ model: AppModel) async {
         wakeTask?.cancel()
+        let repository = repository
+        let engine = engine
         wakeTask = Task { @MainActor [weak model] in
             for await _ in NSWorkspace.shared.notificationCenter.notifications(named: NSWorkspace.didWakeNotification).map({ _ in true }) {
                 guard !Task.isCancelled else { return }
-                if let model, model.monitoringEnabled && !model.isPaused { model.scanNow() }
+                // Synology Drive reconnects after wake. Checking at once reads "offline" for everything and
+                // races the overdue scheduled pass; wait, then run one ordinary background pass.
+                try? await Task.sleep(for: .seconds(45))
+                guard !Task.isCancelled else { return }
+                if let model, model.monitoringEnabled && !model.isPaused {
+                    model.refreshDiskFreeSpace()
+                    await engine.requestReconciliation()
+                }
             }
         }
-        let repository = repository
-        let engine = engine
         await progress.setHandler { [weak model] finding in
             await MainActor.run { model?.applyRepairUpdate(finding) }
         }
@@ -204,10 +224,24 @@ public final class MonitorSession {
 @concurrent private func offMainActor<T: Sendable>(_ work: @Sendable () throws -> T) async throws -> T { try work() }
 
 /// Recovery is loaded even if no watched root is available.
-@concurrent private func restoreRepairOperations(_ env: ManualRequeueAction.Environment, _ repository: FindingRepository) async throws {
+@concurrent func restoreRepairOperations(_ env: ManualRequeueAction.Environment, _ repository: FindingRepository) async throws {
     var restoredFindingIDs: Set<UUID> = []
     for var record in try env.operations.knownRecords() {
-        guard let snapshot = record.finding, restoredFindingIDs.insert(snapshot.id).inserted else { continue }
+        guard let snapshot = record.finding, !restoredFindingIDs.contains(snapshot.id) else { continue }
+        if record.phase == .failed {
+            // A stop before publication never owned the path. Put its saved row back only when the row still shows the
+            // repair in progress (the app stopped between saving the stop and updating the row), or when the row is gone
+            // while a staged copy waits for review. A row that moved on (Check Again, Ignore, a later check) stays.
+            let row = try await repository.finding(id: snapshot.id)
+            let retainsCopy = record.stagedPath.map { FileManager.default.fileExists(atPath: $0) } == true
+            if let row, ![.requeuePreparing, .requeueUploading].contains(row.disposition) {
+                restoredFindingIDs.insert(snapshot.id)
+                continue
+            }
+            // Without a row or a copy there is nothing to show; an older record for this row may still apply.
+            if row == nil && !retainsCopy { continue }
+        }
+        restoredFindingIDs.insert(snapshot.id)
         if [.planned, .stagingPrepared, .clonedOrCopied, .hashed, .publishing, .archiving, .archived, .finalizing].contains(record.phase) {
             record.phase = .recoveryRequired
             record.message = "The operation was interrupted. Review the retained files."

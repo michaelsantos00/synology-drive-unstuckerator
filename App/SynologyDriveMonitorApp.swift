@@ -15,7 +15,7 @@ public struct SynologyDriveMonitorApp: App {
         self.session = session
         var callbacks = session?.callbacks() ?? MonitorCallbacks()
         callbacks.exportDiagnostic = FolderPicking.exportDiagnostic
-        let model = AppModel(pickFolder: FolderPicking.pickFolder, callbacks: callbacks)
+        let model = AppModel(pickFolder: FolderPicking.pickFolder, folderRejection: FolderPicking.rejection, callbacks: callbacks)
         if case .failure(let error) = initialization { model.lastErrorText = "Local recovery storage could not be opened: \(error.localizedDescription)" }
         AppDelegate.onReopen = { [weak model] in model?.handleReopen() }
         FindingNotifier.install { [weak model] findingID in
