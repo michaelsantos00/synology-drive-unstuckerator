@@ -8,6 +8,8 @@ public struct FindingDetailView: View {
     let findingID: UUID
     @State private var recoveryChoice: RecoveryChoice?
     @State private var confirmRecovery = false
+    @State private var closingStoppedRepair = false
+    @State private var closingOperationID: UUID?
     @State private var showsTechnicalDetails = false
     public init(model: AppModel, findingID: UUID) { self.model = model; self.findingID = findingID }
 
@@ -33,7 +35,8 @@ public struct FindingDetailView: View {
                             .help("Restore the original and keep the replacement in Recovery")
                     }
                 }
-                if finding.hasRepairEvidence || [.requeueFailed, .recoveryRequired].contains(finding.disposition) {
+                if finding.hasRepairEvidence || [.requeueFailed, .recoveryRequired].contains(finding.disposition)
+                    || model.hasRetainedStagedCopy(finding) {
                     recoveryInventory(finding)
                 }
                 Section("File") {
@@ -70,13 +73,23 @@ public struct FindingDetailView: View {
                 }
             }
             .formStyle(.grouped)
-            .confirmationDialog("Resolve this interrupted repair?", isPresented: $confirmRecovery) {
-                Button(recoveryChoice == .restoreArchivedOriginal ? "Restore Archived Original" : "Keep Current Original") {
+            .confirmationDialog("Close the earlier stopped attempt?", isPresented: Binding(
+                get: { closingOperationID != nil }, set: { if !$0 { closingOperationID = nil } })) {
+                Button("Retain Staged Copy and Close") { if let id = closingOperationID { model.closeStoppedRepair(id) } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The staged copy moves to Retained Files, where you can export or remove it. This file and any later repair, including its Undo, are not changed.")
+            }
+            .confirmationDialog(closingStoppedRepair ? "Close this stopped repair?" : "Resolve this interrupted repair?", isPresented: $confirmRecovery) {
+                Button(closingStoppedRepair ? "Close Stopped Repair"
+                       : recoveryChoice == .restoreArchivedOriginal ? "Restore Archived Original" : "Keep Current Original") {
                     if let recoveryChoice { model.resolveRecovery(id: findingID, choice: recoveryChoice) }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text(recoveryChoice == .restoreArchivedOriginal
+                Text(closingStoppedRepair
+                    ? "Any staged copy moves to Retained Files, where you can export or remove it. This file’s current status does not change."
+                    : recoveryChoice == .restoreArchivedOriginal
                     ? "The verified archive moves to the empty original path. Other retained copies move into Recovery."
                     : "The current original stays in place. Retry and staged copies move into Recovery. Monitoring then checks the kept file again.")
             }
@@ -170,7 +183,8 @@ public struct FindingDetailView: View {
         case .requeueSucceeded where finding.finalNameFailed:
             "Choose Check Final Name to check again, or Undo to put the original back. Undo stays available until the final filename reports uploaded."
         case .requeueSucceeded:
-            model.canRequeue(finding)
+            // From the operation itself, not from whether a button is enabled (another repair can disable it).
+            model.repairOperations.first(where: { $0.finding?.id == finding.id && $0.phase == .succeeded })?.finalPathVerifiedAt == nil
                 ? "Choose Check Final Name to confirm the final filename uploaded. The 6-hour Undo window starts after that."
                 : "The 6-hour Undo window started when the final filename reported uploaded."
         case .requeueFailed: "Review the copies below. Check Again reads Synology’s status for the original again."
@@ -181,15 +195,27 @@ public struct FindingDetailView: View {
     }
 
     private func recoveryInventory(_ finding: FindingSnapshot) -> some View {
-        let operation = model.repairOperations.first { $0.finding?.id == findingID }
         let originalExists = (try? FileIntegrity.identity(URL(fileURLWithPath: finding.canonicalPath)).exists) == true
+        // A folder or link at the original path is not a file to keep, and it blocks Restore.
+        let originalOccupied = (try? FileManager.default.attributesOfItem(atPath: finding.canonicalPath)) != nil
+        // The same order RepairRecovery.resolve uses (an interrupted operation, else the newest), so the copies shown
+        // are the ones a choice acts on. An older stopped attempt is closed from its row in Retained Files.
+        let operations = model.repairOperations.filter { $0.finding?.id == findingID }
+        let operation = operations.first { $0.phase == .recoveryRequired } ?? operations.first
+        // A stopped repair whose row moved on, or whose original is gone, has nothing to keep or restore.
+        let closesStoppedRepair = operation?.phase == .failed && (finding.disposition != .requeueFailed || !originalExists)
         let archive = model.recoveryFiles.first { $0.record.id == operation?.archiveID }
-        let restoreAvailable = !originalExists && archive?.exists == true
+        let restoreAvailable = !originalOccupied && archive?.exists == true
             && archive?.record.archivedSHA256 != nil && archive?.record.archivedSHA256 == operation?.sourceSHA256
         return Section {
             copyLocation("Current original", finding.canonicalPath)
             if let path = operation?.publishedPath, path != finding.canonicalPath { copyLocation("Published retry", path) }
             if let path = operation?.stagedPath { copyLocation("Staged copy", path) }
+            // The copy "Retain Staged Copy and Close…" acts on, when it belongs to an earlier stopped attempt.
+            if let stopped = operations.first(where: AppModel.retainsStagedCopy), stopped.id != operation?.id,
+               let path = stopped.stagedPath {
+                copyLocation("Staged copy from an earlier attempt", path)
+            }
             if let archive {
                 copyLocation("Archived original", archive.url.path)
                 Text(archive.record.purgeAllowed == true ? "Undo expires \(archive.record.expiresAt.formatted(date: .abbreviated, time: .shortened))." : "Retained without automatic expiry.")
@@ -197,15 +223,35 @@ public struct FindingDetailView: View {
                 Text("Recorded digest: \(archive.record.archivedSHA256 ?? "Unavailable"). Restore rechecks the bytes before moving them.")
                     .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             }
-            if [.recoveryRequired, .requeueFailed, .requeueUploading].contains(finding.disposition) {
-                HStack {
-                    Button("Keep Current Original…") { recoveryChoice = .keepCurrentOriginal; confirmRecovery = true }
-                        .disabled(!originalExists || !model.requeueInFlight.isEmpty)
-                    Button("Restore Archived Original…") { recoveryChoice = .restoreArchivedOriginal; confirmRecovery = true }
-                        .disabled(!restoreAvailable || !model.requeueInFlight.isEmpty)
-                }
-                Text(originalExists ? "Restore needs an empty original path; no choice overwrites an existing file." : "The original path is empty. Restore needs a matching, available archive.")
+            // Keep/Restore act on this row's own operation, so they appear only while that operation needs a decision.
+            // A leftover staged copy from an older stop on a row that later succeeded is closed on its own.
+            if !closesStoppedRepair && ![.recoveryRequired, .requeueFailed, .requeueUploading].contains(finding.disposition),
+               let stopped = operations.first(where: AppModel.retainsStagedCopy) {
+                Button("Retain Staged Copy and Close…") { closingOperationID = stopped.id }
+                    .disabled(!model.requeueInFlight.isEmpty)
+                Text("An earlier attempt stopped before publishing and kept a staged copy. Closing it moves that copy to Retained Files; this file and its later repair are not changed.")
                     .font(.caption).foregroundStyle(.secondary)
+            } else if [.recoveryRequired, .requeueFailed, .requeueUploading].contains(finding.disposition) || closesStoppedRepair {
+                if closesStoppedRepair {
+                    Button("Close Stopped Repair…") {
+                        recoveryChoice = .keepCurrentOriginal; closingStoppedRepair = true; confirmRecovery = true
+                    }
+                    .disabled(!model.requeueInFlight.isEmpty)
+                    Text("This repair stopped before publishing. Closing it moves any staged copy to Retained Files; this file is not changed.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    HStack {
+                        Button("Keep Current Original…") { recoveryChoice = .keepCurrentOriginal; closingStoppedRepair = false; confirmRecovery = true }
+                            .disabled(!originalExists || !model.requeueInFlight.isEmpty)
+                        Button("Restore Archived Original…") { recoveryChoice = .restoreArchivedOriginal; closingStoppedRepair = false; confirmRecovery = true }
+                            .disabled(!restoreAvailable || !model.requeueInFlight.isEmpty)
+                    }
+                    Text(originalOccupied && !originalExists
+                         ? "A folder or link occupies the original path. Move it away before restoring; nothing is overwritten."
+                         : originalExists ? "Restore needs an empty original path; no choice overwrites an existing file."
+                         : "The original path is empty. Restore needs a matching, available archive.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         } header: {
             Text("Copies")

@@ -215,6 +215,170 @@ import DriveMonitorCore
         #expect(!moving.finalNameFailed && moving.disposition == .requeueSucceeded)
     }
 
+    @Test func editingThePlacedReplacementHandsTheFileToRecovery() async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        await fixture.runner.setMode(.uploaded)
+        _ = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: fixture.environment)
+        // Placed; the final name is still uploading.
+        await fixture.runner.setFinalName(output: "fileproviderItems = ({ isUploaded = 0; isUploading = 1; });")
+        let placed = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(placed.disposition == .requeueSucceeded && !placed.finalNameFailed)
+        // The user saves over the replacement before Synology acknowledges the final name.
+        try Data("edited-after-placement".utf8).write(to: fixture.original)
+        let changed = try await ManualRequeueAction.perform(id: placed.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(changed.disposition == .recoveryRequired)
+        #expect(changed.eligibilityBlockReason?.contains("Keep Current Original") == true)
+        // The original stays retained without expiry, and keeping the edit releases the path for monitoring.
+        let archive = try #require(UndoArchive.records(in: fixture.environment.undoRoot).first)
+        #expect(archive.purgeAllowed == false)
+        let recovery = RepairRecovery(operations: fixture.environment.operations, access: fixture.environment.access, undoRoot: fixture.environment.undoRoot)
+        let fresh = try await recovery.resolve(changed, choice: .keepCurrentOriginal)
+        #expect(fresh.disposition == .observing)
+        #expect(try fixture.environment.operations.pending(path: fixture.original.path) == nil)
+        #expect(try String(contentsOf: fixture.original, encoding: .utf8) == "edited-after-placement")
+        #expect(FileManager.default.fileExists(atPath: UndoArchive.payloadURL(archive, root: fixture.environment.undoRoot).path))
+    }
+
+    @Test func anEditThatKeepsSizeAndModificationTimeStillGoesToRecovery() async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        await fixture.runner.setMode(.uploaded)
+        _ = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: fixture.environment)
+        await fixture.runner.setFinalName(output: "fileproviderItems = ({ isUploaded = 0; isUploading = 1; });")
+        let placed = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(placed.disposition == .requeueSucceeded)
+        // Same length, then the modification time is put back: only the change time and the bytes differ.
+        var before = stat()
+        #expect(lstat(fixture.original.path, &before) == 0)
+        try Data("original-B".utf8).write(to: fixture.original)
+        var times = [before.st_atimespec, before.st_mtimespec]
+        #expect(utimensat(AT_FDCWD, fixture.original.path, &times, 0) == 0)
+        let changed = try await ManualRequeueAction.perform(id: placed.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(changed.disposition == .recoveryRequired)
+    }
+
+    @Test func closingAStoppedRepairAfterItsRowMovedOnKeepsTheRow() async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        let probe = WriterOpensDuringPublication()
+        var environment = fixture.environment
+        environment.writeProbe = { _ in await probe.open() }
+        let stopped = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: environment)
+        #expect(stopped.disposition == .requeueFailed)
+        let operation = try #require(try environment.operations.records().first)
+        let staged = try #require(operation.stagedPath)
+        #expect(operation.phase == .failed && FileManager.default.fileExists(atPath: staged))
+        // Check Again confirmed the failure again, so the row moved on.
+        var current = stopped; current.disposition = .actionable
+        try await fixture.repository.upsert(current)
+        let recovery = RepairRecovery(operations: environment.operations, access: environment.access, undoRoot: environment.undoRoot)
+        let result = try await recovery.resolve(current, choice: .keepCurrentOriginal)
+        #expect(result == current)
+        let closed = try #require(try environment.operations.records().first { $0.id == operation.id })
+        #expect(closed.phase == .ignored && closed.finding == nil)
+        #expect(!FileManager.default.fileExists(atPath: staged))
+        #expect(UndoArchive.records(in: environment.undoRoot).contains { $0.operationID == operation.id })
+        #expect(try await fixture.repository.finding(id: current.id)?.disposition == .actionable)
+    }
+
+    @Test func relaunchDoesNotPutAStoppedRepairBackOverARowThatMovedOn() async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        let probe = WriterOpensDuringPublication()
+        var environment = fixture.environment
+        environment.writeProbe = { _ in await probe.open() }
+        let stopped = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: environment)
+        #expect(stopped.disposition == .requeueFailed)
+        // Check Again found the file uploaded.
+        var resolved = stopped; resolved.disposition = .resolved; resolved.providerState = "Synology reports uploaded"
+        try await fixture.repository.upsert(resolved)
+        try await restoreRepairOperations(environment, fixture.repository)
+        #expect(try await fixture.repository.finding(id: stopped.id)?.disposition == .resolved)
+        // If the row itself is gone while the staged copy waits for review, the stop is listed again.
+        try await fixture.repository.remove(id: stopped.id)
+        try await restoreRepairOperations(environment, fixture.repository)
+        #expect(try await fixture.repository.finding(id: stopped.id)?.disposition == .requeueFailed)
+        // Without a staged copy there is nothing to review, so nothing comes back.
+        try await fixture.repository.remove(id: stopped.id)
+        try FileManager.default.removeItem(atPath: try #require(try environment.operations.records().first?.stagedPath))
+        try await restoreRepairOperations(environment, fixture.repository)
+        #expect(try await fixture.repository.finding(id: stopped.id) == nil)
+    }
+
+    @Test(arguments: [true, false]) func relaunchRepairsARowLeftInProgressWhenTheAppStoppedMidStop(keepsCopy: Bool) async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        let probe = WriterOpensDuringPublication()
+        var environment = fixture.environment
+        environment.writeProbe = { _ in await probe.open() }
+        let stopped = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: environment)
+        if !keepsCopy { try FileManager.default.removeItem(atPath: try #require(try environment.operations.records().first?.stagedPath)) }
+        // The app stopped after saving the stop but before updating the row.
+        var inProgress = stopped; inProgress.disposition = .requeuePreparing; inProgress.providerState = "Copy verified"
+        try await fixture.repository.upsert(inProgress)
+        try await restoreRepairOperations(environment, fixture.repository)
+        #expect(try await fixture.repository.finding(id: stopped.id)?.disposition == .requeueFailed)
+    }
+
+    @Test func anOlderStoppedRepairClosesWithoutTouchingANewerRepair() async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        let probe = WriterOpensDuringPublication()
+        var stopping = fixture.environment
+        stopping.writeProbe = { _ in await probe.open() }
+        let stopped = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: stopping)
+        let first = try #require(try fixture.environment.operations.records().first)
+        let staged = try #require(first.stagedPath)
+        // Check Again confirmed it again, and a second Fix placed a replacement.
+        var again = stopped; again.disposition = .actionable
+        try await fixture.repository.upsert(again)
+        await fixture.runner.setMode(.uploaded)
+        let placed = try await ManualRequeueAction.perform(id: again.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(placed.disposition == .requeueSucceeded)
+        await fixture.runner.acknowledgeFinalName()
+        let verified = try await ManualRequeueAction.perform(id: again.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(verified.disposition == .requeueSucceeded)
+        let second = try #require(try fixture.environment.operations.records().first { $0.id != first.id })
+        let recovery = RepairRecovery(operations: fixture.environment.operations, access: fixture.environment.access, undoRoot: fixture.environment.undoRoot)
+        // A completed repair is not a recovery decision: resolving it would discard its Undo.
+        await #expect(throws: MonitoringError.self) { try await recovery.resolve(verified, choice: .keepCurrentOriginal) }
+        #expect(try fixture.environment.operations.records().first { $0.id == second.id } == second)
+        try await recovery.closeStopped(operationID: first.id)
+        let records = try fixture.environment.operations.records()
+        #expect(records.first { $0.id == first.id }?.phase == .ignored)
+        #expect(records.first { $0.id == second.id } == second)
+        #expect(!FileManager.default.fileExists(atPath: staged))
+        #expect(try await fixture.repository.finding(id: placed.id)?.disposition == .requeueSucceeded)
+        // Undo still restores the original afterwards.
+        let undone = try await recovery.undo(verified)
+        #expect(undone.disposition == .resolved)
+        #expect(try String(contentsOf: fixture.original, encoding: .utf8) == "original-A")
+    }
+
+    @Test func aStoppedRepairWhoseOriginalIsGoneCanStillBeClosed() async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        let probe = WriterOpensDuringPublication()
+        var environment = fixture.environment
+        environment.writeProbe = { _ in await probe.open() }
+        let stopped = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: environment)
+        #expect(stopped.disposition == .requeueFailed)
+        try FileManager.default.removeItem(at: fixture.original)
+        let recovery = RepairRecovery(operations: environment.operations, access: environment.access, undoRoot: environment.undoRoot)
+        let result = try await recovery.resolve(stopped, choice: .keepCurrentOriginal)
+        #expect(result == stopped)
+        #expect(try environment.operations.records().first?.phase == .ignored)
+    }
+
+    @Test func aFolderAtTheOriginalPathAfterPlacementGoesToRecovery() async throws {
+        let fixture = try await Fixture(); defer { fixture.remove() }
+        await fixture.runner.setMode(.uploaded)
+        _ = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: fixture.environment)
+        await fixture.runner.setFinalName(output: "fileproviderItems = ({ isUploaded = 0; isUploading = 1; });")
+        let placed = try await ManualRequeueAction.perform(id: fixture.finding.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(placed.disposition == .requeueSucceeded)
+        let moved = fixture.root.appendingPathComponent("moved-away.mp4")
+        try FileManager.default.moveItem(at: fixture.original, to: moved)
+        try FileManager.default.createDirectory(at: fixture.original, withIntermediateDirectories: false)
+        let changed = try await ManualRequeueAction.perform(id: placed.id, repository: fixture.repository, environment: fixture.environment)
+        #expect(changed.disposition == .recoveryRequired)
+        #expect(changed.eligibilityBlockReason?.contains("folder or link") == true)
+    }
+
     @Test func completedReplacementIsNotRediscoveredAsANewAutomaticSource() async throws {
         let fixture = try await Fixture(); defer { fixture.remove() }
         let (finding, savedRoot) = try await fixture.prepareAutomatic()
@@ -435,6 +599,12 @@ private final class RecoveryScanClock: @unchecked Sendable {
     private var date = Date()
     var now: Date { lock.withLock { date } }
     func advance() { lock.withLock { date.addTimeInterval(61) } }
+}
+
+/// Closed when Fix checks first, open by the time it would publish.
+private actor WriterOpensDuringPublication {
+    private var calls = 0
+    func open() -> Bool { calls += 1; return calls >= 2 }
 }
 
 private actor ReopenedWriter {

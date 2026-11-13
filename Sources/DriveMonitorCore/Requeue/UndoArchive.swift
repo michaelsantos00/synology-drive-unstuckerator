@@ -99,8 +99,16 @@ public enum UndoArchive {
                 // Never roll back over a newly created occupant. Both archives survive failure.
                 try FileIntegrity.moveExclusively(cached, original)
                 guard try FileIntegrity.sha256(original) == archivedHash else { throw UndoArchiveError.unverified }
-                current.findingID = nil
-                try write(current, root: root)
+                // The payload is back at its original path and verified. Left in place, the consumed record
+                // would list a "missing" retained file forever. Its folder now holds only the manifest; if
+                // anything else is there, or removal fails, keep the record and detach it instead.
+                let folder = root.appendingPathComponent(current.id.uuidString, isDirectory: true)
+                let payloadFolder = folder.appendingPathComponent("payload", isDirectory: true)
+                let emptied = (try? FileManager.default.contentsOfDirectory(atPath: payloadFolder.path))?.isEmpty == true
+                if !emptied || (try? FileManager.default.removeItem(at: folder)) == nil {
+                    current.findingID = nil
+                    try write(current, root: root)
+                }
                 return original
             }
         }

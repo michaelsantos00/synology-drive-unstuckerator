@@ -33,7 +33,16 @@ public enum FolderPicking {
         try text.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    static var cloudStorage: URL {
+    /// Synology Drive folders live under ~/Library/CloudStorage; others are not uploaded by Drive. Every way of
+    /// adding a folder (the panel, drag and drop) uses this, so none can watch an ordinary local folder.
+    nonisolated public static func rejection(for url: URL) -> String? {
+        let root = cloudStorage.resolvingSymlinksInPath().path
+        guard !url.resolvingSymlinksInPath().path.hasPrefix(root + "/") else { return nil }
+        let error = FolderChoiceError.outsideCloudStorage
+        return [error.errorDescription, error.recoverySuggestion].compactMap { $0 }.joined(separator: " ")
+    }
+
+    nonisolated static var cloudStorage: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage", isDirectory: true)
     }
 
@@ -53,8 +62,7 @@ private final class CloudStorageValidator: NSObject, NSOpenSavePanelDelegate {
     init(root: String) { self.root = root }
 
     func panel(_ sender: Any, validate url: URL) throws {
-        let path = url.resolvingSymlinksInPath().path
-        guard path.hasPrefix(root + "/") else { throw FolderChoiceError.outsideCloudStorage }
+        guard FolderPicking.rejection(for: url) == nil else { throw FolderChoiceError.outsideCloudStorage }
     }
 }
 

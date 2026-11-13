@@ -229,6 +229,13 @@ public actor FindingRepository: FindingStoring {
         return try modelContext.fetch(query).map { try $0.snapshot() }
     }
 
+    public func remove(id: UUID) async throws {
+        for item in try modelContext.fetch(FetchDescriptor<StoredFinding>(predicate: #Predicate { $0.id == id })) {
+            modelContext.delete(item)
+        }
+        try persist()
+    }
+
     public func finding(id: UUID) async throws -> FindingSnapshot? {
         try modelContext.fetch(FetchDescriptor<StoredFinding>(predicate: #Predicate { $0.id == id })).first?.snapshot()
     }

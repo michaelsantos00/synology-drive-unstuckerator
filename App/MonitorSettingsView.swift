@@ -32,6 +32,11 @@ public struct MonitorSettingsView: View {
             diagnostics.tabItem { Label("Diagnostics", systemImage: "stethoscope") }.tag(MonitorSettingsSection.diagnostics)
         }
         .task { await model.refreshNotificationStatus() }
+        .onChange(of: model.requestedSettingsSection, initial: true) { _, requested in
+            guard let requested else { return }
+            section = requested
+            model.requestedSettingsSection = nil
+        }
         .onChange(of: model.watchedRoots.map(\.id), initial: true) {
             if selectedRoot == nil, let first = model.watchedRoots.first { model.selectSettingsRoot(first.id) }
         }
@@ -106,13 +111,13 @@ public struct MonitorSettingsView: View {
                         TextField("Warning threshold", value: threshold, format: .number)
                             .labelsHidden().multilineTextAlignment(.trailing).frame(width: 64)
                             .accessibilityLabel("Warn when free space is below, in GiB")
-                        Stepper("Warning threshold", value: threshold, in: 100...100_000, step: 50).labelsHidden()
+                        Stepper("Warning threshold", value: threshold, in: AppModel.minimumDiskWarningGiB...100_000, step: 10).labelsHidden()
                             .accessibilityLabel("Warn when free space is below, in GiB")
                         Text("GiB")
                     }
                 } label: {
                     Text("Warn when free space is below")
-                    Text("Below 100 GiB a warning always shows. It is only a warning: each repair checks the space it needs before copying.")
+                    Text("Only a warning: each repair checks the space it needs before copying. A cloned repair needs about 20 GiB free.")
                 }
             }
         }
@@ -128,7 +133,8 @@ public struct MonitorSettingsView: View {
     }
 
     private var threshold: Binding<Double> {
-        Binding(get: { max(100, model.lowDiskWarningThresholdGiB) }, set: { model.setLowDiskWarningThreshold(max(100, $0)) })
+        Binding(get: { max(AppModel.minimumDiskWarningGiB, model.lowDiskWarningThresholdGiB) },
+                set: { model.setLowDiskWarningThreshold(max(AppModel.minimumDiskWarningGiB, $0)) })
     }
 
     // MARK: Folders
@@ -311,7 +317,7 @@ public struct MonitorSettingsView: View {
     private var diagnostics: some View {
         Form {
             Section("Privacy") {
-                Toggle(isOn: $model.showRawPaths) {
+                Toggle(isOn: Binding(get: { model.showRawPaths }, set: { model.setShowRawPaths($0) })) {
                     Text("Show full paths and provider identifiers")
                     Text("When off, the app shows file names only and hides identifying details, including in diagnostic reports.")
                 }
@@ -341,7 +347,7 @@ public struct MonitorSettingsView: View {
     private var diagnosticSheet: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Diagnostic Preview").font(.title2.bold()).accessibilityAddTraits(.isHeader)
-            Toggle("Include full paths and provider identifiers", isOn: $model.showRawPaths)
+            Toggle("Include full paths and provider identifiers", isOn: Binding(get: { model.showRawPaths }, set: { model.setShowRawPaths($0) }))
             ScrollView {
                 Text(model.diagnosticSummary()).font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8)

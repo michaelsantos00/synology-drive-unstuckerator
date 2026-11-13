@@ -18,7 +18,9 @@ import Testing
         _ = try UndoArchive.restore(record, root: undoRoot, now: Date(timeIntervalSince1970: 1000 + UndoArchive.retention - 60))
         #expect(try String(contentsOf: original, encoding: .utf8) == "original")
         #expect(try UndoArchive.purgeExpired(root: undoRoot, now: .distantFuture) == 0)
-        let parked = UndoArchive.records(in: undoRoot).filter { $0.id != record.id }
+        // The consumed archive is gone, so Retained Files does not show a "missing" ghost after Undo.
+        let parked = UndoArchive.records(in: undoRoot)
+        #expect(!parked.contains { $0.id == record.id })
         #expect(parked.count == 1)
         #expect(try String(contentsOf: UndoArchive.payloadURL(#require(parked.first), root: undoRoot), encoding: .utf8) == "uploaded")
     }

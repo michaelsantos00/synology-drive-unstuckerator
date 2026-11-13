@@ -130,6 +130,8 @@ public protocol FindingStoring: Sendable {
     func findings(matching disposition: FindingDisposition?) async throws -> [FindingSnapshot]
     func findings(at path: String) async throws -> [FindingSnapshot]
     func append(_ event: ActivityEvent) async throws
+    /// Removes a row that never recorded anything worth keeping, such as a stability-wait placeholder.
+    func remove(id: UUID) async throws
 }
 
 public extension FindingStoring {

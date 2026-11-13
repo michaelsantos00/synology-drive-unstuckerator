@@ -180,7 +180,9 @@ public enum FileProviderParser {
     }
 
     private static func applyError(_ raw: String, to item: inout FileProviderItemState) {
-        guard let match = raw.firstMatch(of: /Error Domain=([A-Za-z0-9.]+) Code=(-?[0-9]+)/) else {
+        // Reverse-DNS and C-constant domains can contain "-" and "_"; without them a readable upload
+        // error would be reported as uninterpretable and stop a retry that should only wait.
+        guard let match = raw.firstMatch(of: /Error Domain=([A-Za-z0-9._\-]+) Code=(-?[0-9]+)/) else {
             return
         }
         item.uploadingErrorDomain = String(match.1)

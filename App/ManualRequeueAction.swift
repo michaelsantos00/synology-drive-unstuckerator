@@ -11,7 +11,9 @@ enum ManualRequeueAction {
         var undoRoot: URL
         var runner: any CommandRunning = ProcessCommandRunner()
         var effects: RequeueEffects = .system()
-        var maxPolls = 240
+        /// About a minute of quick checks after publishing. Longer uploads continue in the background
+        /// verification loop, so one Fix does not hold every other Fix for the length of an upload.
+        var maxPolls = 4
         var pollInterval: Duration = .seconds(15)
         var writeProbe: @Sendable (String) async -> Bool? = { path in
             try? await SystemOpenWriteProbe().isOpenForWriting(path: path)
@@ -197,6 +199,19 @@ enum ManualRequeueAction {
     private static func verifyFinalPlacement(_ record: RequeueJournal, fallback: FindingSnapshot,
                                               repository: FindingRepository, environment env: Environment) async throws -> FindingSnapshot {
         var record = record
+        if record.finalPathVerifiedAt == nil,
+           let change = try? await replacementChange(record, effects: env.effects) {
+            // Waiting cannot succeed: the verified bytes are no longer at the final name. Recovery offers
+            // Keep Current Original (or Restore, when the path is empty); the archived original stays retained.
+            record.phase = .recoveryRequired
+            record.message = change
+            record = enriched(record, fallback: fallback)
+            try env.operations.save(record)
+            let result = record.finding ?? FindingRequeue.snapshot(for: record, fallback: fallback)
+            try await repository.upsert(result)
+            await env.onProgress(result)
+            return result
+        }
         if record.finalPathVerifiedAt == nil {
             do {
                 let path = URL(fileURLWithPath: record.source.canonicalPath)
@@ -260,6 +275,30 @@ enum ManualRequeueAction {
         finding.eligibilityBlockReason = message
         try await repository.upsert(finding)
         return finding
+    }
+
+    /// Why the placed replacement can no longer be confirmed: it was edited, replaced, or removed before
+    /// Synology acknowledged the final name. Nil while it is unchanged, or when a change cannot be proven.
+    private static func replacementChange(_ record: RequeueJournal, effects: RequeueEffects) async throws -> String? {
+        guard record.phase == .succeeded, let placed = record.retryIdentity, let digest = record.retrySHA256 else { return nil }
+        let path = URL(fileURLWithPath: record.source.canonicalPath)
+        let current: RetryFileIdentity
+        do { current = try FileIntegrity.identity(path) }
+        catch RetryFinalizerError.unreadable {
+            // Something other than a regular file (a folder or a link) occupies the original path.
+            return "A folder or link now occupies the original path, so the replacement’s upload can no longer be confirmed. The archived original is retained. Move that item away, then choose Restore Archived Original."
+        }
+        guard current.exists else {
+            return "The replacement is no longer at the original path, so its upload can no longer be confirmed. The archived original is retained; Restore Archived Original puts it back."
+        }
+        // An edit can keep size and modification time, but every write moves change time. When anything touched
+        // the file, compare its bytes; a digest confirmed for this exact identity is reused, so an untouched file
+        // is not re-read on every check. Provider metadata alone moves change time too, so only different bytes,
+        // read while the file held still, count as a change.
+        if current.sameContentMetadata(as: placed), current.changeTime == placed.changeTime { return nil }
+        guard try await !ContentDigest.matches(path, digest: digest, effects: effects),
+              try FileIntegrity.identity(path).sameContentMetadata(as: current) else { return nil }
+        return "The file changed after the replacement was placed, so the replacement’s upload can no longer be confirmed. The archived original is retained. Keep Current Original keeps the current file and resumes monitoring."
     }
 
     private static func evaluatedOutput(_ path: String, runner: any CommandRunning) async throws -> String {

@@ -104,6 +104,16 @@ import Testing
         #expect(!FileProviderParser.isActionablePermanentFailure(item))
     }
 
+    @Test func errorDomainsWithHyphensAndUnderscoresStayReadable() {
+        for domain in ["com.synology-drive.client", "kCFErrorDomain_CFNetwork"] {
+            let parsed = FileProviderParser.parse(wrapper("""
+                isUploaded = 0;
+                uploadingError = "Error Domain=\(domain) Code=-1009 \\"(null)\\"";
+            """))
+            #expect(EvaluationClassification.classify(parsed) == .uploadError(domain: domain, code: -1009))
+        }
+    }
+
     @Test func testQuotedIdentifier() {
         let parsed = FileProviderParser.parse(wrapper("""
             isUploaded = 1;

@@ -56,12 +56,37 @@ public struct RepairRecovery: Sendable {
         }
     }
 
+    /// Closes a repair that stopped before publication. Its private staged copy, if any, moves into retained storage,
+    /// and the operation is detached from rows. It never owned the path, so no row or newer operation changes.
+    public func closeStopped(operationID: UUID) async throws {
+        guard let record = try operations.records().first(where: { $0.id == operationID }), record.phase == .failed else {
+            throw MonitoringError.blocked(reason: "Only a repair that stopped before publication can be closed this way.")
+        }
+        try await access.withAccess(to: record.source.canonicalPath) { try closeStopped(record) }
+    }
+
+    private func closeStopped(_ stopped: RequeueJournal) throws {
+        var record = stopped
+        if let staged = record.stagedPath, FileManager.default.fileExists(atPath: staged) {
+            _ = try UndoArchive.store(file: URL(fileURLWithPath: staged), findingID: nil, root: undoRoot, operationID: record.id)
+        }
+        record.phase = .ignored
+        record.message = "The stopped repair was reviewed. Any staged copy was moved to retained storage."
+        record.updatedAt = Date()
+        // Detached, so relaunch never restores this older snapshot over the row's current state.
+        record.finding = nil
+        try operations.save(record)
+    }
+
     public func resolve(_ finding: FindingSnapshot, choice: RecoveryChoice) async throws -> FindingSnapshot {
         try await access.withAccess(to: finding.canonicalPath) {
             let original = URL(fileURLWithPath: finding.canonicalPath)
             let records = try operations.records()
             var record: RequeueJournal
-            if let existing = records.first(where: { $0.finding?.id == finding.id }) {
+            // A row can have more than one operation (a stopped attempt, then a later one). Resolve an interrupted one
+            // first, otherwise the newest; an older stopped attempt is closed from its own row (closeStopped).
+            let candidates = records.filter { $0.finding?.id == finding.id }
+            if let existing = candidates.first(where: { $0.phase == .recoveryRequired }) ?? candidates.first {
                 record = existing
             } else {
                 // Legacy evidence is sufficient for an explicit keep-current choice, never automatic finalization.
@@ -70,6 +95,21 @@ public struct RepairRecovery: Sendable {
                         fileSize: finding.fileSize, modificationTime: finding.modificationDate),
                     publishedPath: finding.retryPath, updatedAt: Date())
                 record.finding = finding
+            }
+            // Recovery choices are for an operation that still needs a decision. A completed repair keeps its Undo; a
+            // closed one has nothing left to resolve.
+            guard ![.ignored, .undone].contains(record.phase), record.phase != .succeeded || record.requiresRecovery else {
+                throw MonitoringError.blocked(reason: "This repair is complete or already closed; there is nothing to resolve.")
+            }
+            // A repair that stopped before publication never owned the path. Once its row has moved on (Check Again),
+            // or the original is gone or no longer a file, there is nothing to keep or restore: close it alone.
+            let originalIsFile = (try? FileIntegrity.identity(original))?.exists == true
+            if record.phase == .failed, finding.disposition != .requeueFailed || !originalIsFile {
+                guard choice == .keepCurrentOriginal else {
+                    throw MonitoringError.blocked(reason: "This stopped repair has no archived original to restore.")
+                }
+                try closeStopped(record)
+                return finding
             }
             guard !records.contains(where: { $0.id != record.id && $0.source.canonicalPath == finding.canonicalPath && $0.requiresRecovery }) else {
                 throw MonitoringError.blocked(reason: "Another unresolved operation owns this path. Review that operation first.")

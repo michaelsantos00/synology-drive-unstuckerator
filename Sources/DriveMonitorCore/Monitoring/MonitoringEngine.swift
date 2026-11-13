@@ -36,6 +36,10 @@ public enum MonitoringError: Error, LocalizedError, Sendable {
     }
 }
 
+/// Where a check came from. Scans and file events are background work; a targeted check is the user
+/// asking about one file (Check Again, Check File).
+enum CheckOrigin: Sendable { case event, scan, targeted }
+
 public actor MonitoringEngine {
     public private(set) var isPaused = false
     public private(set) var lastScanAt: Date?
@@ -66,6 +70,17 @@ public actor MonitoringEngine {
     private var onStoreChange: @Sendable () async -> Void = {}
     private var started = false
     private var generation = UUID()
+    /// Bumped by every store write, so a check that changed nothing does not refresh the UI.
+    private var storeWrites = 0
+    /// Versions Synology reported uploaded, so scheduled scans do not relaunch `fileproviderctl` for each
+    /// healthy file every few minutes. Entries expire; events, follow-ups, and targeted checks ignore them.
+    private var uploadedVersions: [String: (metadata: FileMetadata, checkedAt: Date)] = [:]
+    static let uploadedCacheLifetime: TimeInterval = 60 * 60
+    /// Command failures in a row; a scan stops once Synology Drive looks unresponsive instead of
+    /// waiting on every remaining file.
+    private var consecutiveProviderFailures = 0
+    static let providerFailureLimit = 3
+    static let stabilityWaitState = "Waiting for a stable file"
 
     public init(
         store: any FindingStoring,
@@ -192,12 +207,12 @@ public actor MonitoringEngine {
 
     @discardableResult
     public func handle(path: String) async throws -> MonitoringDecision {
-        try await evaluate(path: path, manual: false)
+        try await evaluate(path: path, manual: false, origin: .event)
     }
 
     @discardableResult
     public func evaluateFile(_ path: String) async throws -> MonitoringDecision {
-        try await evaluate(path: path, manual: true)
+        try await evaluate(path: path, manual: true, origin: .targeted)
     }
 
     @discardableResult
@@ -206,7 +221,8 @@ public actor MonitoringEngine {
     }
 
     public func reconcile() async throws {
-        guard started, !isPaused else { return }
+        // A scan already in progress covers this pass; reporting it as blocked would only add noise.
+        guard started, !isPaused, !scanning else { return }
         try installWatchers()
         let checked = try await scanRecentFiles(manual: false)
         try await recheckKnownFailures(excluding: checked, manual: false)
@@ -214,6 +230,11 @@ public actor MonitoringEngine {
 
     public func scanNow() async throws {
         guard started else { throw MonitoringError.blocked(reason: "Choose and confirm a watched folder first.") }
+        // Scan Now joins a background scan instead of failing: wait for it, then check again from the top.
+        while scanning {
+            try await Task.sleep(for: .milliseconds(250))
+            guard started else { throw CancellationError() }
+        }
         if !isPaused { try installWatchers() }
         let scanned = try await scanRecentFiles(manual: true)
         try await recheckKnownFailures(excluding: scanned, manual: true)
@@ -226,7 +247,8 @@ public actor MonitoringEngine {
         for finding in unresolved where !checked.contains(finding.canonicalPath) && !unavailableRootIDs.contains(finding.rootIdentifier) {
             guard started, !Task.isCancelled, manual || (!isPaused && generation == scanGeneration) else { break }
             checked.insert(finding.canonicalPath)
-            _ = try await evaluate(path: finding.canonicalPath, manual: manual)
+            _ = try await evaluate(path: finding.canonicalPath, manual: manual, origin: .scan)
+            try stopIfProviderUnresponsive()
         }
     }
 
@@ -240,6 +262,8 @@ public actor MonitoringEngine {
         let scanDate = now()
         let cutoff = scanDate.addingTimeInterval(-7 * 24 * 60 * 60)
         var evaluated: Set<String> = []
+        var gaps = ScanGaps()
+        consecutiveProviderFailures = 0
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey, .contentModificationDateKey]
         for root in roots where root.enabled {
             guard started, manual || (!isPaused && generation == scanGeneration) else { break }
@@ -251,10 +275,13 @@ public actor MonitoringEngine {
                         guard started, !Task.isCancelled, manual || (!isPaused && generation == scanGeneration) else { break }
                         let path = url.standardizedFileURL.path
                         guard evaluated.insert(path).inserted else { continue }
-                        _ = try await evaluate(path: path, manual: manual)
+                        _ = try await evaluate(path: path, manual: manual, origin: .scan)
+                        try stopIfProviderUnresponsive()
                     }
                 }
+                gaps.merge(await discovery.gaps)
             } catch is CancellationError { throw CancellationError() }
+            catch let error as ProviderUnresponsiveError { throw error }
             catch {
                 unavailableRootIDs.insert(root.id)
                 watchingRootIDs.remove(root.id)
@@ -266,22 +293,34 @@ public actor MonitoringEngine {
 
         guard started, generation == scanGeneration, !Task.isCancelled else { throw CancellationError() }
         lastScanAt = scanDate
-        try await record(.scan, summary: "Recent-file scan completed.", details: "Seven-day window; \(evaluated.count) candidate paths inspected.")
+        if gaps.count == 0 {
+            try await record(.scan, summary: "Recent-file scan completed.", details: "Seven-day window; \(evaluated.count) candidate paths inspected.")
+        } else {
+            // Unreadable folders are not evidence that their files are healthy; say what was missed.
+            try await record(.scan, summary: "Recent-file scan completed, but \(gaps.count) item\(gaps.count == 1 ? "" : "s") could not be read.",
+                details: "Seven-day window; \(evaluated.count) candidate paths inspected. Not checked: "
+                    + gaps.samples.joined(separator: ", ") + (gaps.count > gaps.samples.count ? ", …" : "")
+                    + ". Files inside unreadable folders are not checked until they can be read.")
+        }
         await onStoreChange()
         return evaluated
     }
 
-    private func evaluate(path: String, manual: Bool) async throws -> MonitoringDecision {
+    private func evaluate(path: String, manual: Bool, origin: CheckOrigin) async throws -> MonitoringDecision {
         // Path rules need no lease. Checking them first keeps temporary and ineligible files from
         // leaving a lock file behind, and from triggering store refreshes, on every file event.
         if let rejection = pathRuleRejection(path) { return rejection }
         do {
+            let writes = storeWrites
             let decision = try await repairAccess.withAccess(to: path) {
-                try await self.evaluateLocked(path: path, manual: manual)
+                try await self.evaluateLocked(path: path, manual: manual, origin: origin)
             }
             // Consumers may start a repair in response; release the scan's path lease first.
-            await onPathChange(path)
-            await onStoreChange()
+            // A check that wrote nothing (a healthy file with no row) has nothing to show.
+            if storeWrites != writes {
+                await onPathChange(path)
+                await onStoreChange()
+            }
             return decision
         } catch RepairAccessError.busy {
             return .blocked(reason: "A check or repair already owns this path; the rest of the scan can continue.")
@@ -301,7 +340,7 @@ public actor MonitoringEngine {
         return nil
     }
 
-    private func evaluateLocked(path: String, manual: Bool) async throws -> MonitoringDecision {
+    private func evaluateLocked(path: String, manual: Bool, origin: CheckOrigin) async throws -> MonitoringDecision {
         guard path.hasPrefix("/") else { return .blocked(reason: "An absolute file path is required.") }
         guard started, manual || !isPaused else { return .blocked(reason: "Monitoring is stopped or paused.") }
         let url = URL(fileURLWithPath: path).standardizedFileURL
@@ -359,24 +398,29 @@ public actor MonitoringEngine {
             && Self.isUnresolved(older.disposition) && !older.hasRepairEvidence {
             older.disposition = .sourceChanged
             older.eligibilityBlockReason = "A newer observation tracks this path; this snapshot is retained as history."
-            try await store.upsert(older)
+            try await save(older)
         }
         if !manual, let existing, [.ignored, .resolved, .requeueSucceeded].contains(existing.disposition) {
             return .rejected(reason: "This source version has already been ignored or resolved.")
+        }
+        // A stopped repair keeps its review state (and its recovery choices) until the user acts on it:
+        // Check Again or a recovery choice. Background checks must not quietly make it fixable again.
+        if origin != .targeted, let existing, existing.disposition == .requeueFailed {
+            return .rejected(reason: "A stopped repair is waiting for review.")
         }
         let age = now().timeIntervalSince(metadata.modified)
         if age < root.minimumStableAge {
             let reason = "This file is \(Int(age)) seconds old. Confirmation waits until it is \(Int(root.minimumStableAge)) seconds old so a file still being written is not treated as a failed upload."
             var finding = existing ?? metadata.finding(root: root, at: now())
             finding.lastCheckedAt = now()
-            finding.providerState = "Waiting for a stable file"
+            finding.providerState = Self.stabilityWaitState
             finding.eligibilityBlockReason = reason
             finding.disposition = .observing
             finding.confirmationCount = 0
             finding.lastConfirmedAt = nil
             finding.errorDomain = nil
             finding.errorCode = nil
-            try await store.upsert(finding)
+            try await save(finding)
             scheduleFollowUp(path: canonical, after: .seconds(max(1, root.minimumStableAge - age + 1)))
             return .rejected(reason: reason)
         }
@@ -386,6 +430,14 @@ public actor MonitoringEngine {
         guard started, generation == workGeneration, !Task.isCancelled else {
             return .blocked(reason: "Monitoring changed before evaluation could start.")
         }
+        if origin == .scan, !manual, existing == nil, let cached = uploadedVersions[canonical], cached.metadata == metadata,
+           now().timeIntervalSince(cached.checkedAt) < Self.uploadedCacheLifetime {
+            return .evaluated
+        }
+        uploadedVersions[canonical] = nil
+        // A file with no failure on record that cannot be checked is not news; only targeted checks
+        // and files already being tracked get a "Could not read" row.
+        let quietOnProviderFailure = origin != .targeted && (existing.map(Self.isUnconfirmedPlaceholder) ?? true)
         let result: CommandResult
         do {
             result = try await runner.run(executable: URL(fileURLWithPath: "/usr/bin/fileproviderctl"),
@@ -394,8 +446,13 @@ public actor MonitoringEngine {
             guard started, generation == workGeneration, !Task.isCancelled else {
                 return .blocked(reason: "Monitoring changed while evaluation was in progress.")
             }
-            return try await block(path: canonical, root: root, metadata: metadata, previous: existing,
-                                   reason: "Provider evaluation failed: \(error.localizedDescription)", raw: nil)
+            consecutiveProviderFailures += 1
+            let reason = "Provider evaluation failed: \(error.localizedDescription)"
+            if let confirmed = existing, Self.isConfirmed(confirmed) {
+                return try await keepConfirmed(confirmed, path: canonical, state: Self.statusUnavailableState, raw: nil)
+            }
+            if quietOnProviderFailure { return .blocked(reason: reason) }
+            return try await block(path: canonical, root: root, metadata: metadata, previous: existing, reason: reason, raw: nil)
         }
         guard started, generation == workGeneration, !Task.isCancelled else {
             return .blocked(reason: "Monitoring changed while evaluation was in progress.")
@@ -405,10 +462,17 @@ public actor MonitoringEngine {
                                    reason: "The source version changed during evaluation.", raw: result.standardOutput)
         }
         guard result.exitCode == 0, !result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            consecutiveProviderFailures += 1
+            let reason = "Provider output is unreadable or the command failed (exit \(result.exitCode))."
+            if let confirmed = existing, Self.isConfirmed(confirmed) {
+                return try await keepConfirmed(confirmed, path: canonical, state: Self.statusUnavailableState,
+                                               raw: result.standardOutput + "\n" + result.standardError)
+            }
+            if quietOnProviderFailure { return .blocked(reason: reason) }
             return try await block(path: canonical, root: root, metadata: metadata, previous: existing,
-                                   reason: "Provider output is unreadable or the command failed (exit \(result.exitCode)).",
-                                   raw: result.standardOutput + "\n" + result.standardError)
+                                   reason: reason, raw: result.standardOutput + "\n" + result.standardError)
         }
+        consecutiveProviderFailures = 0
         let parsed = interpreting.parse(result.standardOutput)
         let classification = interpreting.classify(parsed)
         if case .incompatible(let reason) = parsed {
@@ -418,17 +482,25 @@ public actor MonitoringEngine {
             return try await block(path: canonical, root: root, metadata: metadata, previous: existing, reason: reason, raw: result.standardOutput)
         }
         guard case .item(let item) = parsed else {
+            // "Couldn't find a file" often means Drive is still reconnecting. It says nothing new about a
+            // confirmed failure, and nothing at all about a file with no failure on record.
+            if let confirmed = existing, Self.isConfirmed(confirmed) {
+                return try await keepConfirmed(confirmed, path: canonical, state: Self.description(.missingItem), raw: result.standardOutput)
+            }
+            let reason = "No provider item is available to verify this source."
+            if quietOnProviderFailure { return .blocked(reason: reason) }
             return try await block(path: canonical, root: root, metadata: metadata, previous: existing,
-                                   reason: "No provider item is available to verify this source.", raw: result.standardOutput)
+                                   reason: reason, raw: result.standardOutput)
         }
         // Respect local Ignore/Resolve changes made while the command was running.
-        if let refreshed = try await store.findings(matching: nil).first(where: {
+        if let refreshed = try await store.findings(at: canonical).first(where: {
             $0.rootIdentifier == root.id && metadata.matches($0)
         }) { existing = refreshed }
         guard started, generation == workGeneration, !Task.isCancelled else {
             return .blocked(reason: "Monitoring changed while evaluation was in progress.")
         }
         let checkedAt = now()
+        uploadedVersions[canonical] = nil
         var finding = existing ?? metadata.finding(root: root, at: checkedAt)
         finding.lastCheckedAt = checkedAt
         finding.fileProviderItemIdentifier = item.itemIdentifier
@@ -444,7 +516,15 @@ public actor MonitoringEngine {
                 return try await block(path: canonical, root: root, metadata: metadata, previous: existing,
                                        reason: "Uploaded status conflicts with the provider item or its upload error.", raw: result.standardOutput)
             }
-            guard existing != nil else { return .evaluated }
+            rememberUploaded(canonical, metadata, at: checkedAt)
+            guard let existing else { return .evaluated }
+            // A row that only waited for the file to settle never showed a failure. Synology uploading it is
+            // the normal outcome, not a resolution worth listing under Recent.
+            if Self.isUnconfirmedPlaceholder(existing) {
+                storeWrites += 1
+                try await store.remove(id: existing.id)
+                return .evaluated
+            }
             finding.providerState = "Synology reports uploaded"
             finding.uploadVerifiedAt = checkedAt
             finding.eligibilityBlockReason = nil
@@ -461,7 +541,7 @@ public actor MonitoringEngine {
                 finding.confirmationCount = 0
                 finding.lastConfirmedAt = nil
                 if !locallyClosed && finding.disposition != .existingNeedsReview { finding.disposition = .observing }
-                try await store.upsert(finding)
+                try await save(finding)
                 try await record(.requeueBlocked, findingID: finding.id, summary: "Failure confirmation blocked.", details: finding.eligibilityBlockReason)
                 return .blocked(reason: finding.eligibilityBlockReason!)
             }
@@ -505,7 +585,18 @@ public actor MonitoringEngine {
             }
 
         case .uploading, .notUploaded, .excluded, .syncPaused, .missingItem, .uploadError:
-            guard existing != nil else { return .evaluated }
+            guard let previous = existing else { return .evaluated }
+            // Offline, paused, or briefly missing says nothing new about a confirmed failure: keep it listed with
+            // its confirmations (docs/safety.md). Uploading, not uploaded, or excluded do change the picture.
+            if Self.isConfirmed(previous), !locallyClosed, Self.saysNothingNew(classification) {
+                finding.providerState = Self.description(classification)
+                finding.errorDomain = previous.errorDomain
+                finding.errorCode = previous.errorCode
+                finding.confirmationCount = previous.confirmationCount
+                finding.lastConfirmedAt = previous.lastConfirmedAt
+                finding.eligibilityBlockReason = Self.keptConfirmedReason(finding.providerState)
+                break
+            }
             finding.providerState = Self.description(classification)
             finding.confirmationCount = 0
             finding.lastConfirmedAt = nil
@@ -519,7 +610,7 @@ public actor MonitoringEngine {
         case .incompatible:
             return .blocked(reason: "Provider output is incompatible.")
         }
-        try await store.upsert(finding)
+        try await save(finding)
         if existing == nil || existing?.disposition != finding.disposition || existing?.confirmationCount != finding.confirmationCount {
             try await record(existing == nil ? .findingDetected : .findingConfirmed, findingID: finding.id,
                              summary: "\(finding.filename): \(finding.providerState)", details: finding.eligibilityBlockReason,
@@ -537,11 +628,17 @@ public actor MonitoringEngine {
         for var finding in previous where Self.isUnresolved(finding.disposition)
             && !finding.hasRepairEvidence && finding.attemptCount == 0
             && finding.sourceSHA256 == nil && finding.retrySHA256 == nil && finding.uploadVerifiedAt == nil {
+            // A row that only waited for the file to settle recorded nothing worth keeping.
+            if Self.isUnconfirmedPlaceholder(finding) {
+                storeWrites += 1
+                try await store.remove(id: finding.id)
+                continue
+            }
             finding.disposition = .sourceChanged
             finding.lastCheckedAt = now()
             finding.providerState = "Not an eligible file"
             finding.eligibilityBlockReason = "This path is no longer an eligible file (\(reason)). This observation is kept as history."
-            try await store.upsert(finding)
+            try await save(finding)
             try await record(.lifecycle, findingID: finding.id,
                              summary: "\(finding.filename): not an eligible file; kept as history.",
                              details: reason, result: finding.disposition.rawValue)
@@ -557,13 +654,21 @@ public actor MonitoringEngine {
             return .blocked(reason: "The watched folder is unavailable.")
         }
         // Repair evidence and ignore decisions keep their rows; other states describe a file that is gone.
+        // A stopped repair never published anything, so its row is history too once the file is gone; a staged
+        // copy it kept stays listed in Retained Files until it is reviewed.
         for var finding in previous where !finding.hasRepairEvidence
-            && [.observing, .compatibilityBlocked, .actionable, .existingNeedsReview].contains(finding.disposition) {
+            && [.observing, .compatibilityBlocked, .actionable, .existingNeedsReview, .requeueFailed].contains(finding.disposition) {
+            // A file saved and removed (or renamed) within the stability wait never showed a failure.
+            if Self.isUnconfirmedPlaceholder(finding) {
+                storeWrites += 1
+                try await store.remove(id: finding.id)
+                continue
+            }
             finding.disposition = .sourceChanged
             finding.lastCheckedAt = now()
             finding.providerState = Self.movedOrDeletedState
             finding.eligibilityBlockReason = "The file is no longer at this path. This observation is kept as history."
-            try await store.upsert(finding)
+            try await save(finding)
             try await record(.lifecycle, findingID: finding.id, summary: "\(finding.filename): moved or deleted; kept as history.",
                              result: finding.disposition.rawValue)
         }
@@ -585,8 +690,11 @@ public actor MonitoringEngine {
         finding.confirmationCount = 0
         finding.lastConfirmedAt = nil
         finding.rawDiagnostic = raw
-        try await store.upsert(finding)
-        try await record(.compatibility, findingID: finding.id, summary: "Verification blocked for \(finding.filename).", details: finding.eligibilityBlockReason)
+        try await save(finding)
+        // A file that stays blocked for the same reason is logged once, not on every scan.
+        if previous?.disposition != finding.disposition || previous?.eligibilityBlockReason != finding.eligibilityBlockReason {
+            try await record(.compatibility, findingID: finding.id, summary: "Verification blocked for \(finding.filename).", details: finding.eligibilityBlockReason)
+        }
         return .blocked(reason: finding.eligibilityBlockReason!)
     }
 
@@ -623,7 +731,61 @@ public actor MonitoringEngine {
             .max { $0.path.count < $1.path.count }
     }
 
+    static let statusUnavailableState = "Synology status unavailable"
+
+    static func isConfirmed(_ finding: FindingSnapshot) -> Bool {
+        [.actionable, .existingNeedsReview].contains(finding.disposition)
+    }
+
+    /// Readings that do not tell whether a confirmed stuck upload has cleared.
+    static func saysNothingNew(_ classification: EvaluationClassification) -> Bool {
+        switch classification {
+        case .syncPaused, .missingItem, .uploadError: true
+        default: false
+        }
+    }
+
+    static func keptConfirmedReason(_ state: String) -> String {
+        "Synology currently reports “\(state)”. The confirmed failure stays listed; Fix checks Synology’s current status before making a copy."
+    }
+
+    /// Keeps a confirmed failure, with its confirmations and error, through a reading that says nothing new.
+    /// Re-reads the row so an Ignore or Resolve made while the command ran is not overwritten.
+    private func keepConfirmed(_ confirmed: FindingSnapshot, path: String, state: String, raw: String?) async throws -> MonitoringDecision {
+        guard var kept = try await store.findings(at: path).first(where: { $0.id == confirmed.id }),
+              Self.isConfirmed(kept) else { return .evaluated }
+        kept.lastCheckedAt = now()
+        kept.providerState = state
+        kept.eligibilityBlockReason = Self.keptConfirmedReason(state)
+        if let raw { kept.rawDiagnostic = raw }
+        try await save(kept)
+        return .evaluated
+    }
+
+    private func stopIfProviderUnresponsive() throws {
+        guard consecutiveProviderFailures >= Self.providerFailureLimit else { return }
+        throw ProviderUnresponsiveError()
+    }
+
+    private func rememberUploaded(_ path: String, _ metadata: FileMetadata, at date: Date) {
+        if uploadedVersions.count >= 20_000 { uploadedVersions.removeAll(keepingCapacity: true) }
+        uploadedVersions[path] = (metadata, date)
+    }
+
+    /// A row created only while the file waited to settle (or grew): no provider failure, no confirmation, no repair.
+    static func isUnconfirmedPlaceholder(_ finding: FindingSnapshot) -> Bool {
+        finding.disposition == .observing && finding.confirmationCount == 0 && finding.lastConfirmedAt == nil
+            && finding.errorCode == nil && finding.attemptCount == 0 && !finding.hasRepairEvidence
+            && [stabilityWaitState, FileMetadata.awaitingConfirmationState].contains(finding.providerState)
+    }
+
+    private func save(_ finding: FindingSnapshot) async throws {
+        storeWrites += 1
+        try await store.upsert(finding)
+    }
+
     private func record(_ kind: ActivityKind, findingID: UUID? = nil, summary: String, details: String? = nil, result: String? = nil) async throws {
+        storeWrites += 1
         try await store.append(ActivityEvent(id: UUID(), timestamp: now(), kind: kind, findingID: findingID,
                                              summary: summary, details: details, result: result))
     }
@@ -694,13 +856,19 @@ public actor MonitoringEngine {
         }
     }
 
+    /// The reason the last scheduled pass was blocked, so an unresponsive Drive is logged once, not every 5 minutes.
+    private var lastScheduledBlock: String?
+
     private func scheduledReconcile() async {
-        do { try await reconcile() }
+        do { try await reconcile(); lastScheduledBlock = nil }
         catch is CancellationError { return }
         catch {
             lastError = error.localizedDescription
+            guard lastScheduledBlock != lastError else { return }
+            lastScheduledBlock = lastError
             do { try await record(.compatibility, summary: "Scheduled reconciliation was blocked.", details: lastError) }
             catch { lastError = error.localizedDescription }
+            await onStoreChange()
         }
     }
 
@@ -734,6 +902,13 @@ public actor MonitoringEngine {
         private let keys: Set<URLResourceKey>
         private var enumerator: FileManager.DirectoryEnumerator?
         private var initialized = false
+        private let enumerationErrors = GapRecorder()
+        private var unreadableEntries = ScanGaps()
+        var gaps: ScanGaps {
+            var all = unreadableEntries
+            all.merge(enumerationErrors.snapshot)
+            return all
+        }
         init(root: WatchedRootSnapshot, cutoff: Date, scanDate: Date, keys: Set<URLResourceKey>) {
             self.root = root; self.cutoff = cutoff; self.scanDate = scanDate; self.keys = keys
         }
@@ -744,7 +919,12 @@ public actor MonitoringEngine {
                 guard try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
                     throw MonitoringError.blocked(reason: "Watched folder is unavailable: \(root.displayName)")
                 }
-                enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles, .skipsPackageDescendants])
+                let recorder = enumerationErrors
+                enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: Array(keys),
+                    options: [.skipsHiddenFiles, .skipsPackageDescendants]) { failed, _ in
+                    recorder.add(failed.path)
+                    return true
+                }
                 guard enumerator != nil else { throw MonitoringError.blocked(reason: "Watched folder cannot be scanned: \(root.displayName)") }
                 initialized = true
             }
@@ -755,7 +935,7 @@ public actor MonitoringEngine {
                 inspected += 1
                 try Task.checkCancellation()
                 if url.pathComponents.contains(".git") { enumerator.skipDescendants(); continue }
-                guard let values = try? url.resourceValues(forKeys: keys) else { continue }
+                guard let values = try? url.resourceValues(forKeys: keys) else { unreadableEntries.add(url.path); continue }
                 if values.isSymbolicLink == true { enumerator.skipDescendants(); continue }
                 guard MonitoringEngine.extensionIsEligible(url, root: root), !MonitoringEngine.isIgnored(url, root: root),
                       values.isDirectory != true, values.isRegularFile == true, values.isSymbolicLink == false,
@@ -811,6 +991,7 @@ public actor MonitoringEngine {
     }
 
     private struct FileMetadata: Equatable {
+        static let awaitingConfirmationState = "Awaiting confirmation"
         var canonicalPath: String
         var inode: UInt64
         var size: Int64
@@ -824,7 +1005,7 @@ public actor MonitoringEngine {
         func finding(root: WatchedRootSnapshot, at date: Date) -> FindingSnapshot {
             FindingSnapshot(id: UUID(), canonicalPath: canonicalPath, filename: URL(fileURLWithPath: canonicalPath).lastPathComponent,
                 rootIdentifier: root.id, inode: inode, fileSize: size, modificationDate: modified, firstDetectedAt: date,
-                lastCheckedAt: date, providerState: "Awaiting confirmation", confirmationCount: 0, attemptCount: 0, disposition: .observing)
+                lastCheckedAt: date, providerState: Self.awaitingConfirmationState, confirmationCount: 0, attemptCount: 0, disposition: .observing)
         }
 
         func observation(from finding: FindingSnapshot) -> ConfirmationObservation? {
@@ -880,4 +1061,33 @@ public struct ProcessCommandRunner: CommandRunning {
         }
         return try await BoundedProcess.run(executable: executable, arguments: arguments, timeout: 60)
     }
+}
+
+/// Synology Drive stopped answering status checks during a scan.
+struct ProviderUnresponsiveError: LocalizedError {
+    var errorDescription: String? {
+        "Synology Drive is not answering status checks, so this scan stopped early. The next scan tries again."
+    }
+}
+
+/// Items a scan could not read: a count, and a few paths to show.
+struct ScanGaps: Sendable {
+    private(set) var count = 0
+    private(set) var samples: [String] = []
+    mutating func add(_ path: String) {
+        count += 1
+        if samples.count < 3 { samples.append(URL(fileURLWithPath: path).lastPathComponent) }
+    }
+    mutating func merge(_ other: ScanGaps) {
+        count += other.count
+        samples = Array((samples + other.samples).prefix(3))
+    }
+}
+
+/// The directory enumerator reports errors from a callback that is not isolated to the scan.
+private final class GapRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var gaps = ScanGaps()
+    func add(_ path: String) { lock.withLock { gaps.add(path) } }
+    var snapshot: ScanGaps { lock.withLock { gaps } }
 }
